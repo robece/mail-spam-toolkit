@@ -3,6 +3,7 @@
 # After this, setup.sh ensures all new files are created with correct ownership.
 # Safe to delete once verified.
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET_USER="$(id -u):$(id -g)"
 
 fix_dir() {
@@ -17,9 +18,8 @@ fix_dir() {
     fi
 }
 
-# Run from source/portal/ — these paths are relative to that location
-fix_dir database
-fix_dir temp
-fix_dir ../data
+fix_dir "$SCRIPT_DIR/database"
+fix_dir "$SCRIPT_DIR/temp"
+fix_dir "$SCRIPT_DIR/../data"
 
 echo "Done."
