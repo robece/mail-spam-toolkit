@@ -7,6 +7,6 @@ chown "$(id -u):$(id -g)" database
 mkdir -p temp
 chown "$(id -u):$(id -g)" temp
 
-sudo docker compose build
+UID=$(id -u) GID=$(id -g) sudo --preserve-env=UID,GID docker compose build
 echo "Portal running at http://localhost:8080"
-sudo docker compose up
+UID=$(id -u) GID=$(id -g) sudo --preserve-env=UID,GID docker compose up

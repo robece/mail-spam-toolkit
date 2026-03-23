@@ -2,6 +2,7 @@ services:
   portal:
     build: .
     container_name: mail-spam-toolkit-portal
+    user: "${UID}:${GID}"
     ports:
       - "8080:8080"
     volumes:
