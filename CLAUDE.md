@@ -3,8 +3,9 @@
 ## ⚠️ Security Directive
 
 **NEVER** include, reference, read, or expose contents of:
-- `source/data/` — contains personal `.eml` files
-- `source/portal/database/` — contains SQLite DB with personal email data and extracted attachments
+- `source/data/` — contains personal `.eml` files and attachment backups
+- `source/portal/database/` — contains SQLite DB with personal email data
+- `source/portal/temp/` — contains on-demand extracted attachments
 
 These folders are gitignored and must **never** appear in commits, diffs, logs, or any output.
 
@@ -35,16 +36,21 @@ source/
 │   │   ├── app.js            # WebSocket client + all screen renderers
 │   │   └── style.css         # GitHub-dark theme, monospace, CSS variables
 │   ├── database/             # ← GITIGNORED (runtime only)
-│   │   ├── spam_toolkit.db   # SQLite database (persistent)
-│   │   ├── attachments/      # Extracted email attachments
-│   │   └── deleted/          # Attachment backups before server deletion
+│   │   └── spam_toolkit.db   # SQLite database (persistent)
+│   ├── temp/                 # ← GITIGNORED (runtime only, ephemeral)
+│   │   └── {sender}/         # On-demand extracted attachments for viewing/download
 │   ├── Dockerfile
 │   ├── docker-compose.yaml
 │   ├── requirements.txt
+│   ├── setup.sh              # build + start (creates database/ and temp/ with correct ownership)
+│   ├── teardown.sh           # stop
+│   ├── fix-permissions.sh    # disposable: aligns ownership/permissions of existing volume files
 │   └── migrate_add_accounts.sql  # Migration script for existing installs
 │
 └── data/                     # ← GITIGNORED (runtime only)
     └── {account_name}/       # Per-account .eml files
+        └── deleted/          # Attachment backups before server deletion
+            └── {sender}/     # {XXXX}_{filename} — 4-char UID prefix per file
 ```
 
 ---
@@ -53,15 +59,25 @@ source/
 
 ```bash
 cd source/portal
-sh setup.sh       # build + start
-sh teardown.sh    # stop
+bash setup.sh       # build + start
+bash teardown.sh    # stop
 ```
 
 - App at `http://localhost:8080`
 - SQLite browser at `http://localhost:8081`
 - Mounts `../data` → `/workspace/data`
 - Mounts `./database` → `/workspace/database`
-- Environment variables: `DATA_DIR`, `DB_DIR`, `DB_PATH`
+- Mounts `./temp` → `/workspace/temp`
+- Environment variables: `DATA_DIR`, `DB_DIR`, `DB_PATH`, `TEMP_DIR`
+
+### First-time permission fix (existing installs only)
+
+If `data/`, `database/`, or `temp/` were previously created by Docker as root:
+
+```bash
+cd source/portal
+bash fix-permissions.sh
+```
 
 ---
 
@@ -74,9 +90,20 @@ sh teardown.sh    # stop
 - **Loading phase**: streams progress events to WebSocket during startup scan
 - **CPU-bound scanning**: runs in `ThreadPoolExecutor` to avoid blocking async loop
 - **WAL mode**: SQLite with WAL + foreign keys enabled
-- **Path traversal protection**: `/download/{rel_path}` validates against `DB_DIR`
+- **Path traversal protection**: `/download/{rel_path}` validates against `TEMP_DIR`
 - **Protonmail deletion**: cookie-based session import (browser cookie), saved to SQLite, reused on subsequent runs
-- **Attachment backup**: attachments extracted to `database/deleted/` before server deletion
+- **Attachment backup**: before server deletion, attachments are extracted to `data/{account}/deleted/{sender}/` using a 4-char uppercase UID prefix + cleaned filename (flat per sender, no subfolders)
+- **On-demand attachment extraction**: when viewing attachments, files are extracted to `temp/{sender}/{XXXX}_{filename}` and served via `/download/`; temp is ephemeral
+- **Container runs as host user**: `docker-compose.yaml` uses `user: "${UID}:${GID}"` so all files created inside mounted volumes are owned by the host user, not root
+- **Volume ownership**: `setup.sh` creates `database/` and `temp/` with correct host ownership before Docker mounts them
+
+### Folder responsibility separation
+| Folder | Created by | Purpose |
+|--------|-----------|---------|
+| `database/` | `setup.sh` | SQLite DB — persistent |
+| `temp/` | `setup.sh` | Extracted attachments — ephemeral, view-only |
+| `data/{account}/` | App (on account creation) | `.eml` source files |
+| `data/{account}/deleted/` | App (on server deletion) | Attachment backups — permanent |
 
 ---
 
@@ -202,8 +229,8 @@ proton_sessions:
 Host .eml files (data/{account_name}/)
     │
     └─→ [Portal] scans incrementally → SQLite (accounts/senders/emails/attachments)
-                                      → database/attachments/ (extracted on view)
-                                      → database/deleted/     (backup before deletion)
+                                      → temp/{sender}/        (extracted on view, ephemeral)
+                                      → data/{account}/deleted/{sender}/  (backup before deletion)
                                       → Protonmail API        (server-side deletion)
 ```
 
@@ -211,7 +238,8 @@ Host .eml files (data/{account_name}/)
 
 ## What's Gitignored (source/.gitignore)
 
-- `data/` — all `.eml` files (personal email content)
-- `portal/database/` — SQLite DB, attachments, deleted backups (personal data)
+- `data/` — all `.eml` files and deleted attachment backups (personal data)
+- `portal/database/` — SQLite DB (personal data)
+- `portal/temp/` — on-demand extracted attachments (ephemeral, personal data)
 - `__pycache__/`, `*.pyc`, `*.pyo` — Python bytecode
 - `.DS_Store`, `Thumbs.db` — OS metadata
