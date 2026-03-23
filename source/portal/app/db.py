@@ -1,4 +1,3 @@
-import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,13 +12,6 @@ def init(db_path: Path) -> None:
     _db_path = db_path
     db_dir = db_path.parent
     db_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        ref = Path(__file__).parent
-        st  = ref.stat()
-        os.chown(db_dir, st.st_uid, st.st_gid)
-        os.chmod(db_dir, st.st_mode)
-    except Exception:
-        pass
     with _conn() as conn:
         _create_schema(conn)
         _migrate_schema(conn)
