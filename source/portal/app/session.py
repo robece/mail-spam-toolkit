@@ -240,7 +240,7 @@ class Session:
         elif k == "o":
             em = emails[self.email_cursor] if emails and 0 <= self.email_cursor < len(emails) else None
             if em and em.has_attachments:
-                self.attachment_info = self._extract_attachments(em, self.email_cursor)
+                self.attachment_info = self._extract_attachments(em)
                 self.screen          = "attachments"
         elif k == "s":
             self.analytics_year = None
@@ -402,14 +402,22 @@ class Session:
                     pass
         return sorted(years, reverse=True)
 
-    def _extract_attachments(self, em: EmailRecord, idx: int) -> list[dict]:
+    def _extract_attachments(self, em: EmailRecord) -> list[dict]:
+        import random, string
+
+        def _uid() -> str:
+            return "".join(random.choices(string.ascii_uppercase, k=4))
+
+        def _clean(name: str) -> str:
+            return re.sub(r"[^\w.\-]", "", name.replace(" ", ""))
+
         results = []
         try:
             with open(em.eml_path, "rb") as f:
                 msg = email_lib.message_from_bytes(f.read())
             safe_sender = re.sub(r"[^\w\-.]", "_", self.current_sender)
             att_base    = self.temp_dir
-            out_dir     = att_base / safe_sender / str(idx)
+            out_dir     = att_base / safe_sender
             out_dir.mkdir(parents=True, exist_ok=True)
             if msg.is_multipart():
                 for part in msg.walk():
@@ -418,14 +426,15 @@ class Session:
                     disposition = part.get_content_disposition()
                     filename    = part.get_filename()
                     if disposition == "attachment" or (filename and disposition != "inline"):
-                        fname   = filename or f"attachment.{part.get_content_subtype()}"
+                        raw     = filename or f"attachment.{part.get_content_subtype()}"
+                        fname   = f"{_uid()}_{_clean(raw)}" or f"{_uid()}_attachment"
                         payload = part.get_payload(decode=True)
                         if payload:
                             out_path = out_dir / fname
                             out_path.write_bytes(payload)
                             rel = out_path.relative_to(att_base)
                             results.append({
-                                "filename":     fname,
+                                "filename":     raw,
                                 "content_type": part.get_content_type(),
                                 "size_bytes":   len(payload),
                                 "download_url": f"/download/{rel}",
