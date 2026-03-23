@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mail Spam Toolkit</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="header" class="header-bar">Mail Spam Toolkit</div>
+  <div id="filter-bar" class="filter-bar" style="display:none">
+    <input id="filter-input" type="text" placeholder="Filter by sender..." autocomplete="off" spellcheck="false">
+  </div>
+  <div id="content" class="content-area">
+    <div class="loading-screen">
+      <div class="loading-title">Loading data…</div>
+      <div class="loading-msg">Connecting to server…</div>
+      <div class="loading-bar-wrap">
+        <div class="loading-bar-fill loading-bar-indeterminate"></div>
+      </div>
+      <div class="loading-pct"></div>
+    </div>
+  </div>
+  <div id="status" class="status-bar"></div>
+  <div id="footer" class="footer-bar"></div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
