@@ -52,23 +52,31 @@ async def _load_data() -> None:
 
 # ── attachment backup ─────────────────────────────────────────────────────────
 
-def _backup_attachments(db_dir: Path, eml_path: str, sender: str, idx: int) -> None:
+def _backup_attachments(db_dir: Path, eml_path: str, sender: str) -> None:
     """Extract and save attachments from a .eml file before deletion."""
+    import random, string
+
+    def _uid() -> str:
+        return "".join(random.choices(string.ascii_uppercase, k=4))
+
+    def _clean(name: str) -> str:
+        return re.sub(r"[^\w.\-]", "", name.replace(" ", ""))
+
     try:
         with open(eml_path, "rb") as f:
             msg = email_lib.message_from_bytes(f.read())
         if not msg.is_multipart():
             return
-        safe_sender = re.sub(r"[^\w\-.]", "_", sender)
-        out_dir     = db_dir / "deleted" / safe_sender / str(idx)
-        saved       = False
+        out_dir = db_dir / "deleted" / sender
+        saved   = False
         for part in msg.walk():
             if part.get_content_maintype() == "multipart":
                 continue
             disposition = part.get_content_disposition()
             filename    = part.get_filename()
             if disposition == "attachment" or (filename and disposition != "inline"):
-                fname   = filename or f"attachment.{part.get_content_subtype()}"
+                raw     = filename or f"attachment.{part.get_content_subtype()}"
+                fname   = f"{_uid()}_{_clean(raw)}" or f"{_uid()}_attachment"
                 payload = part.get_payload(decode=True)
                 if payload:
                     if not saved:
@@ -231,7 +239,7 @@ async def _deletion_worker(session: Session, safe_send) -> None:
 
         for idx, eml_path in enumerate(session._emails_to_delete):
             # 1. Backup attachments before any destructive action
-            _backup_attachments(DB_DIR, eml_path, sender, idx)
+            _backup_attachments(DB_DIR, eml_path, sender)
 
             # 2. Delete from Protonmail server
             ok = False
