@@ -9,10 +9,11 @@ MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec
 
 
 class Session:
-    def __init__(self, app_data: AppData, db_dir: Path, data_dir: Path | None = None):
+    def __init__(self, app_data: AppData, db_dir: Path, data_dir: Path | None = None, temp_dir: Path | None = None):
         self.data            = app_data
         self.db_dir          = db_dir
         self.data_dir        = data_dir
+        self.temp_dir        = temp_dir or (db_dir / "temp")
         self.screen          = "senders"
         self.cursor          = 0
         self.email_cursor    = 0
@@ -407,7 +408,7 @@ class Session:
             with open(em.eml_path, "rb") as f:
                 msg = email_lib.message_from_bytes(f.read())
             safe_sender = re.sub(r"[^\w\-.]", "_", self.current_sender)
-            att_base    = self.db_dir / "attachments"
+            att_base    = self.temp_dir
             out_dir     = att_base / safe_sender / str(idx)
             out_dir.mkdir(parents=True, exist_ok=True)
             if msg.is_multipart():

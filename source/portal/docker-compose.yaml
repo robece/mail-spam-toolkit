@@ -6,12 +6,14 @@ services:
       - "8080:8080"
     volumes:
       - ../data:/workspace/data          # .eml source files (external, volatile)
-      - ./database:/workspace/database   # SQLite + attachments (persistent, part of portal)
+      - ./database:/workspace/database   # SQLite (persistent, part of portal)
+      - ./temp:/workspace/temp           # extracted attachments (on-demand, ephemeral)
       - ./frontend:/workspace/frontend   # static files (hot-reload without rebuild)
     environment:
       - DATA_DIR=/workspace/data
       - DB_DIR=/workspace/database
       - DB_PATH=/workspace/database/spam_toolkit.db
+      - TEMP_DIR=/workspace/temp
     restart: unless-stopped
 
   sqlite-web:

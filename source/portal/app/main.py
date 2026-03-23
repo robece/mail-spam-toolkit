@@ -14,9 +14,10 @@ from . import db
 from .scanner import scan_or_load, AppData
 from .session import Session
 
-DATA_DIR     = Path(os.environ.get("DATA_DIR", "/workspace/data"))
-DB_DIR       = Path(os.environ.get("DB_DIR",   "/workspace/database"))
-DB_PATH      = Path(os.environ.get("DB_PATH",  "/workspace/database/spam_toolkit.db"))
+DATA_DIR     = Path(os.environ.get("DATA_DIR",  "/workspace/data"))
+DB_DIR       = Path(os.environ.get("DB_DIR",    "/workspace/database"))
+DB_PATH      = Path(os.environ.get("DB_PATH",   "/workspace/database/spam_toolkit.db"))
+TEMP_DIR     = Path(os.environ.get("TEMP_DIR",  "/workspace/temp"))
 FRONTEND_DIR = Path("/workspace/frontend")
 
 # ── shared loading state ──────────────────────────────────────────────────────
@@ -52,7 +53,7 @@ async def _load_data() -> None:
 
 # ── attachment backup ─────────────────────────────────────────────────────────
 
-def _backup_attachments(db_dir: Path, eml_path: str, sender: str) -> None:
+def _backup_attachments(eml_path: str, sender: str) -> None:
     """Extract and save attachments from a .eml file before deletion."""
     import random, string
 
@@ -62,12 +63,20 @@ def _backup_attachments(db_dir: Path, eml_path: str, sender: str) -> None:
     def _clean(name: str) -> str:
         return re.sub(r"[^\w.\-]", "", name.replace(" ", ""))
 
+    def _account_from_path(p: str) -> str | None:
+        try:
+            parts = Path(p).relative_to(DATA_DIR).parts
+            return parts[0] if len(parts) > 1 else None
+        except ValueError:
+            return None
+
     try:
         with open(eml_path, "rb") as f:
             msg = email_lib.message_from_bytes(f.read())
         if not msg.is_multipart():
             return
-        out_dir = db_dir / "deleted" / sender
+        account = _account_from_path(eml_path)
+        out_dir = (DATA_DIR / account / "deleted" / sender) if account else (DB_DIR / "deleted" / sender)
         saved   = False
         for part in msg.walk():
             if part.get_content_maintype() == "multipart":
@@ -239,7 +248,7 @@ async def _deletion_worker(session: Session, safe_send) -> None:
 
         for idx, eml_path in enumerate(session._emails_to_delete):
             # 1. Backup attachments before any destructive action
-            _backup_attachments(DB_DIR, eml_path, sender)
+            _backup_attachments(eml_path, sender)
 
             # 2. Delete from Protonmail server
             ok = False
@@ -314,8 +323,7 @@ async def lifespan(app: FastAPI):
     global _loop
     _loop = asyncio.get_event_loop()
     db.init(DB_PATH)
-    (DB_DIR / "attachments").mkdir(parents=True, exist_ok=True)
-    (DB_DIR / "deleted").mkdir(parents=True, exist_ok=True)
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
     _enqueue_and_broadcast({"type": "loading", "data": {
         "message": "Initializing…", "current": 0, "total": 1, "done": False,
     }})
@@ -484,7 +492,7 @@ async def captcha_proxy(request: Request, path: str) -> Response:
 
 @app.get("/download/{rel_path:path}")
 async def download_file(rel_path: str):
-    base      = (DB_DIR / "attachments").resolve()
+    base      = TEMP_DIR.resolve()
     file_path = (base / rel_path).resolve()
     if not str(file_path).startswith(str(base)):
         raise HTTPException(status_code=403)
@@ -538,7 +546,7 @@ async def ws_endpoint(websocket: WebSocket):
     while app_data is None:
         await asyncio.sleep(0.05)
 
-    session   = Session(app_data, DB_DIR, DATA_DIR)
+    session   = Session(app_data, DB_DIR, DATA_DIR, TEMP_DIR)
     send_lock = asyncio.Lock()
 
     async def safe_send(data: dict) -> None:
