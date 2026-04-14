@@ -1,0 +1,48 @@
+services:
+  mail-spam-toolkit-portal:
+    build: ./source/portal
+    image: mail-spam-toolkit-portal:local
+    container_name: mail-spam-toolkit-portal
+    user: "${UID}:${GID}"
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./source/data:/workspace/data
+      - ./source/portal/database:/workspace/database
+      - ./source/portal/temp:/workspace/temp
+      - ./source/portal/frontend:/workspace/frontend
+    environment:
+      DATA_DIR: /workspace/data
+      DB_DIR: /workspace/database
+      DB_PATH: /workspace/database/spam_toolkit.db
+      TEMP_DIR: /workspace/temp
+    networks:
+      - mail-spam-toolkit-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mail-spam-toolkit-sqlite:
+    image: coleifer/sqlite-web:latest
+    container_name: mail-spam-toolkit-sqlite
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./source/portal/database:/data
+    entrypoint: ["sqlite_web", "-H", "0.0.0.0", "-p", "8080", "/data/spam_toolkit.db"]
+    networks:
+      - mail-spam-toolkit-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  mail-spam-toolkit-network:
+    name: mail-spam-toolkit-network
+    driver: bridge
