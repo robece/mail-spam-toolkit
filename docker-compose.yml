@@ -3,20 +3,15 @@ services:
     build: ./source/portal
     image: mail-spam-toolkit-portal:local
     container_name: mail-spam-toolkit-portal
-    user: "${UID}:${GID}"
     restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
-      - ./source/data:/workspace/data
-      - ./source/portal/database:/workspace/database
-      - ./source/portal/temp:/workspace/temp
+      - mail-spam-toolkit-db:/workspace/database
       - ./source/portal/frontend:/workspace/frontend
     environment:
-      DATA_DIR: /workspace/data
-      DB_DIR: /workspace/database
       DB_PATH: /workspace/database/spam_toolkit.db
-      TEMP_DIR: /workspace/temp
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-production}
     networks:
       - mail-spam-toolkit-network
     logging:
@@ -32,7 +27,7 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - ./source/portal/database:/data
+      - mail-spam-toolkit-db:/data
     entrypoint: ["sqlite_web", "-H", "0.0.0.0", "-p", "8080", "/data/spam_toolkit.db"]
     networks:
       - mail-spam-toolkit-network
@@ -41,6 +36,10 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  mail-spam-toolkit-db:
+    name: mail-spam-toolkit-db
 
 networks:
   mail-spam-toolkit-network:

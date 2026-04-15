@@ -4,12 +4,10 @@
 
 set -euo pipefail
 
-# -- Always run from project root ---------------------------------------------
 cd "$(dirname "$0")/.."
 
 SERVICE="mail-spam-toolkit"
 
-# -- Resolve docker command (WSL calls docker.exe on the Windows host) --------
 DOCKER="docker"
 if grep -qi microsoft /proc/version 2>/dev/null; then
     DOCKER="docker.exe"
@@ -21,24 +19,20 @@ echo "  $SERVICE setup"
 echo "================================================"
 echo ""
 
-# -- Verify Docker is running -------------------------------------------------
 if ! $DOCKER info &>/dev/null; then
     echo "[error] Docker is not running. Start the Docker service and try again."
-    echo "        powershell: Start-Service docker"
     exit 1
 fi
 
-# -- Create volume directories with correct host ownership --------------------
-echo "[*] Preparing directories..."
-mkdir -p source/portal/database
-chown "$(id -u):$(id -g)" source/portal/database
-mkdir -p source/portal/temp
-chown "$(id -u):$(id -g)" source/portal/temp
-echo "[ok] Directories ready."
+if [ -z "${JWT_SECRET:-}" ]; then
+    echo "[warn]  JWT_SECRET is not set. A default placeholder will be used."
+    echo "        Set it in your environment before running in production:"
+    echo "        export JWT_SECRET=\$(openssl rand -hex 32)"
+    echo ""
+fi
 
-# -- Build and start ----------------------------------------------------------
 echo "[*] Building and starting $SERVICE..."
-UID=$(id -u) GID=$(id -g) $DOCKER compose up -d --build
+$DOCKER compose up -d --build --force-recreate
 
 echo ""
 echo "[ok] $SERVICE is running."

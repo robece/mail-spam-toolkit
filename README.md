@@ -1,60 +1,100 @@
 # mail-spam-toolkit
 
-Web-based toolkit for analyzing, managing, and deleting spam emails stored as `.eml` files.
+Multi-user web app for bulk analysis and deletion of spam/newsletter emails.
 
-## Overview
+**Privacy model:** email data never leaves the browser. The server handles only user authentication and acts as a stateless Protonmail API proxy. Each user's email index is stored in their own browser's IndexedDB.
 
-- **Portal** — FastAPI web app with WebSocket-driven terminal-style UI at port 8080
-- **sqlite-web** — lightweight SQLite browser UI at port 8081 for DB inspection
+## Architecture
 
-The portal scans `.eml` files incrementally, stores metadata in SQLite, and connects to the Protonmail API for server-side email deletion.
+```
+Browser
+├── File System Access API  — reads .eml / .metadata.json locally
+├── EML parser (JS)         — extracts sender, subject, date, Protonmail ID
+├── IndexedDB               — persists parsed data per user, keyed by user ID
+└── Protonmail delete flow  — user pastes session cookie, client calls proxy
 
-## Requirements
-
-- Docker
-
-## Configuration
-
-No environment variables required. Internal paths are fixed inside the container.
-
-| Variable | Value | Description |
-|---|---|---|
-| `DATA_DIR` | `/workspace/data` | `.eml` source files |
-| `DB_DIR` | `/workspace/database` | SQLite database directory |
-| `DB_PATH` | `/workspace/database/spam_toolkit.db` | SQLite database file |
-| `TEMP_DIR` | `/workspace/temp` | On-demand extracted attachments (ephemeral) |
-
-## Deploy
-
-### Local development
-
-```bash
-./deploy/setup.sh
-./deploy/teardown.sh
+Server (FastAPI)
+├── POST /auth/register     — creates user (email + bcrypt password)
+├── POST /auth/login        — returns JWT
+├── GET  /auth/me           — validates token
+├── POST /proton/verify-session — validates a pasted Protonmail cookie (stateless)
+├── POST /proton/delete     — proxies deletion to Protonmail API (stateless)
+└── POST /proton/find-id    — resolves RFC Message-ID to Protonmail internal ID
 ```
 
-**Windows only — open firewall ports:**
+The server stores **only** the `users` table (id, email, hashed password). No email content, senders, or subjects are ever stored server-side.
+
+## Services
+
+| Service | Port | Description |
+|---|---|---|
+| `mail-spam-toolkit-portal` | 8080 | Portal web app (FastAPI + static SPA) |
+| `mail-spam-toolkit-sqlite` | 8081 | SQLite Web — database browser (dev only) |
+
+## Setup
+
+### Prerequisites
+- Docker Desktop (Windows/Mac) or Docker Engine + Compose (Linux)
+- WSL or Git Bash (Windows)
+
+### Quick start
+
+```bash
+# Optional but recommended: set a real secret before starting
+export JWT_SECRET=$(openssl rand -hex 32)
+
+bash deploy/setup.sh
+```
+
+Open **http://localhost:8080**, register an account, then import your email export directory.
+
+### Windows firewall
+
 ```powershell
+# Run as Administrator to open ports 8080 and 8081
 .\deploy\firewall-config.ps1
+
+# Remove rules
 .\deploy\firewall-config.ps1 -Remove
 ```
 
-### First-time permission fix (existing installs only)
-
-If `source/portal/database/` or `source/portal/temp/` were previously created by Docker as root:
+### Teardown
 
 ```bash
-cd source/portal && bash fix-permissions.sh
+bash deploy/teardown.sh
 ```
 
-## Ports
+## Importing emails
 
-| Port | Description |
-|---|---|
-| 8080 | Portal web UI |
-| 8081 | sqlite-web DB browser |
+### Protonmail Export
 
-## Repository Structure
+1. In Protonmail web: Settings → Export → Export all messages
+2. Extract the ZIP — you'll get a folder with `.eml` + `.metadata.json` pairs
+3. In the app: **Import** → **Choose Folder** → select the exported folder
+4. The app reads all files locally and indexes them in your browser
+
+The `.metadata.json` files contain the Protonmail internal message ID, which is required for server-side deletion.
+
+### Other providers (.eml only)
+
+Select the folder containing `.eml` files. The app parses headers client-side. Server-side deletion is not available without Protonmail metadata, but you can still browse and analyze senders.
+
+## Deleting emails from Protonmail
+
+1. Select a sender → choose emails → click **Delete selected**
+2. Open Protonmail in another tab → F12 → Network → click any request → copy the **Cookie** header value
+3. Paste it into the session field and click **Verify**
+4. Confirm deletion — messages are permanently removed from the server
+5. The session credentials are used once and discarded (never stored)
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `JWT_SECRET` | `change-this-secret-in-production` | Secret key for JWT signing — **must be set in production** |
+| `DB_PATH` | `/workspace/database/spam_toolkit.db` | Path to the SQLite database inside the container |
+
+## Repository structure
 
 ```
 mail-spam-toolkit/
@@ -64,115 +104,16 @@ mail-spam-toolkit/
 │   ├── teardown.sh
 │   └── firewall-config.ps1
 └── source/
-    ├── data/                         # gitignored — .eml files per account
-    │   └── {account_name}/
-    │       └── deleted/{sender}/     # attachment backups before server deletion
     └── portal/
-        ├── app/
-        │   ├── main.py               # FastAPI server, WebSocket handler, lifespan, workers
-        │   ├── db.py                 # SQLite schema + all DB operations
-        │   ├── scanner.py            # Incremental .eml scanner with DB caching
-        │   ├── session.py            # Per-connection session state + render logic
-        │   └── protonmail.py         # Protonmail API client (SRP auth, deletion)
-        ├── frontend/
-        │   ├── index.html            # Single-page app shell
-        │   ├── app.js                # WebSocket client + all screen renderers
-        │   └── style.css             # GitHub-dark theme, monospace, CSS variables
-        ├── database/                 # gitignored — SQLite DB (persistent)
-        ├── temp/                     # gitignored — on-demand extracted attachments
         ├── Dockerfile
         ├── requirements.txt
-        └── fix-permissions.sh        # aligns ownership of existing volume files
-```
-
-## Architecture
-
-- **Incremental scanning**: tracks `eml_path UNIQUE` in SQLite; only rescans new files
-- **Account-based folders**: `.eml` files live in `source/data/{account_name}/`
-- **WebSocket session model**: stateful `Session` object per client connection
-- **Container runs as host user**: `user: "${UID}:${GID}"` so volume files are owned by host user
-- **WAL mode**: SQLite with WAL + foreign keys enabled
-- **Path traversal protection**: `/download/{rel_path}` validates against `TEMP_DIR`
-- **Protonmail deletion**: cookie-based session import saved to SQLite, reused on subsequent runs
-- **Attachment backup**: before server deletion, attachments are extracted to `source/data/{account}/deleted/{sender}/`
-
-## SQLite Schema
-
-```sql
-accounts:   id, name (UNIQUE), provider (protonmail|gmail), created_at, disabled_at
-senders:    id, email (UNIQUE), unsubscribe_url, email_count, status, account_id (FK)
-emails:     id, sender_id (FK), eml_path (UNIQUE), subject, date_str, preview,
-            has_attachments, scanned_at, server_deleted_at, local_deleted_at
-attachments: id, email_id (FK), filename, content_type, size_bytes
-proton_sessions: username (PK), uid, access_token, session_id, saved_at
-```
-
-## Key Bindings
-
-### Senders screen
-
-| Key | Action |
-|---|---|
-| `↑↓` | Navigate |
-| `Enter` | Open emails for sender |
-| `O` | Open unsubscribe URL |
-| `S` | Sender analytics |
-| `A` | Global analytics |
-| `X` | Deleted senders |
-| `C` | Accounts management |
-| `Q` | Quit |
-
-### Emails screen
-
-| Key | Action |
-|---|---|
-| `↑↓` | Navigate |
-| `Space` | Select/unselect email |
-| `A` | Select/deselect all |
-| `O` | View attachments |
-| `S` | Sender analytics |
-| `D` | Delete selected on server |
-| `B` | Back |
-
-### Deleted Senders screen
-
-| Key | Action |
-|---|---|
-| `↑↓` | Navigate |
-| `Enter` | View deleted emails |
-| `U` | Toggle unsubscribed |
-| `B` | Back |
-
-### Accounts screen
-
-| Key | Action |
-|---|---|
-| `↑↓` | Navigate |
-| `N` | New account |
-| `D` | Toggle disable/enable |
-| `B` | Back |
-
-## Navigation Flow
-
-```
-[account_setup]  ← shown on first launch if no accounts exist
-     ↓
-[senders]
-     ↓ Enter              ↓ X                  ↓ C
-  [emails]        [deleted_senders]          [accounts]
-     ↓ Space+D         ↓ Enter                  ↓ N
-  [import_session]  [deleted_emails]       [account_setup]
-     ↓
-  [delete_progress]
-     ↓ O
-  [attachments]
-     ↓ S
-  [sender_analytics / analytics]
-```
-
-## Logs
-
-```bash
-docker compose logs -f
-docker compose logs -f portal
+        ├── app/
+        │   ├── auth.py         JWT utilities
+        │   ├── db.py           SQLite (users table only)
+        │   ├── main.py         FastAPI app (auth + Protonmail proxy)
+        │   └── protonmail.py   Cookie-string parser helper
+        └── frontend/
+            ├── index.html      SPA shell
+            ├── app.js          Full client-side app (EML parser, IndexedDB, screens)
+            └── style.css       GitHub-dark theme
 ```

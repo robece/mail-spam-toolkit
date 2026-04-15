@@ -1,933 +1,1299 @@
 'use strict';
 
-let ws;
+// ─── Config ──────────────────────────────────────────────────────────────────
 
-function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => setStatus('Connected.');
-  ws.onmessage = (e) => render(JSON.parse(e.data));
-  ws.onclose = () => { setStatus('Reconnecting...'); setTimeout(connect, 1500); };
-  ws.onerror = () => ws.close();
+const API = '';  // same origin
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+const S = {
+  token: localStorage.getItem('mst_token'),
+  userId: null,
+  userEmail: null,
+  screen: 'auth',
+  authMode: 'login',   // 'login' | 'register'
+  db: null,
+  senders: [],
+  filteredSenders: [],
+  filterSenders: '',
+  selectedSender: null,
+  emails: [],
+  filteredEmails: [],
+  filterEmails: '',
+  selectedEmailIds: new Set(),
+  protonSession: null,   // { uid, access_token, session_id } — never stored in IDB/localStorage
+  sessionValid: null,    // true | false | null
+  deleteLog: [],
+  deleteDone: false,
+  deleteInProgress: false,
+  previewEmail: null,    // { subject, preview }
+  fileHandles: new Map(),  // messageId → FileSystemFileHandle (ephemeral)
+  importState: { total: 0, done: 0, running: false, cancelled: false },
+};
+
+// ─── JWT utils ────────────────────────────────────────────────────────────────
+
+function parseJwt(token) {
+  try {
+    return JSON.parse(atob(token.split('.')[1]));
+  } catch { return null; }
 }
 
-function send(key) {
-  if (ws && ws.readyState === WebSocket.OPEN)
-    ws.send(JSON.stringify({ key }));
+function initFromToken(token) {
+  const payload = parseJwt(token);
+  if (!payload || !payload.sub) return false;
+  S.token = token;
+  S.userId = payload.sub;
+  return true;
 }
 
-function sendHvResult(token, type) {
-  if (ws && ws.readyState === WebSocket.OPEN)
-    ws.send(JSON.stringify({ hv_result: { token, type } }));
+// ─── API client ───────────────────────────────────────────────────────────────
+
+async function apiFetch(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (S.token) headers['Authorization'] = `Bearer ${S.token}`;
+  const r = await fetch(API + path, { ...opts, headers });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(body.detail || `HTTP ${r.status}`), { status: r.status });
+  return body;
 }
 
-function sendGoto(idx) {
-  if (ws && ws.readyState === WebSocket.OPEN)
-    ws.send(JSON.stringify({ goto: idx }));
+async function apiRegister(email, password) {
+  return apiFetch('/auth/register', { method: 'POST', body: JSON.stringify({ email, password }) });
 }
 
-function sendTextInput(text) {
-  if (ws && ws.readyState === WebSocket.OPEN)
-    ws.send(JSON.stringify({ text_input: text }));
+async function apiLogin(email, password) {
+  return apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
 }
 
-// ── global keyboard handler ──────────────────────────────────────────────────
-
-document.addEventListener('keydown', (e) => {
-  if (e.ctrlKey || e.metaKey) return;
-
-  const active = document.activeElement;
-
-  // Auth password / HV code inputs: Enter submits, Escape cancels
-  if (active && (active.id === 'auth-password' || active.id === 'hv-code' ||
-                 active.id === 'import-uid' || active.id === 'account-name')) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      const val = active.value;
-      active.value = '';
-      sendTextInput(val);
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      active.value = '';
-      send('Escape');
-    }
-    return;
-  }
-
-  // Filter input: only Escape clears + blurs
-  if (active === document.getElementById('filter-input')) {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      const inp = document.getElementById('filter-input');
-      inp.value = '';
-      inp.blur();
-      if (_sendersData) renderSendersTable(_sendersData);
-    }
-    return;
-  }
-
-  // Deleted emails filter: Escape clears + blurs
-  if (active === document.getElementById('deleted-filter')) {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      const inp = document.getElementById('deleted-filter');
-      inp.value = '';
-      inp.blur();
-      if (_deletedData) renderDeletedEmailsTable(_deletedData);
-    }
-    return;
-  }
-
-  // Emails filter: Escape clears + blurs
-  if (active === document.getElementById('emails-filter')) {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      const inp = document.getElementById('emails-filter');
-      inp.value = '';
-      inp.blur();
-      if (_emailsData) renderEmailsTable(_emailsData);
-    }
-    return;
-  }
-
-  // Deleted senders filter: Escape clears + blurs
-  if (active === document.getElementById('deleted-senders-filter')) {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      const inp = document.getElementById('deleted-senders-filter');
-      inp.value = '';
-      inp.blur();
-      if (_deletedSendersData) renderDeletedSendersTable(_deletedSendersData);
-    }
-    return;
-  }
-
-  if (active && active.classList.contains('url-input')) return;
-
-  const allowed = [
-    'ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Enter','Escape',' ',
-    'u','U','o','O','a','A','s','S','q','Q','b','B','c','C','d','D','n','N','v','V','x','X','1','2',
-  ];
-  if (allowed.includes(e.key)) {
-    e.preventDefault();
-    send(e.key);
-  }
-});
-
-// Filter input live filtering
-document.getElementById('filter-input').addEventListener('input', () => {
-  if (_sendersData) renderSendersTable(_sendersData);
-});
-
-// ── render dispatcher ────────────────────────────────────────────────────────
-
-function render(msg) {
-  ({
-    loading:          renderLoading,
-    account_setup:    renderAccountSetup,
-    accounts:         renderAccounts,
-    senders:          renderSenders,
-    emails:           renderEmails,
-    attachments:      renderAttachments,
-    analytics:        renderAnalytics,
-    sender_analytics: renderSenderAnalytics,
-    server_select:    renderServerSelect,
-    auth_prompt:      renderAuthPrompt,
-    delete_progress:  renderDeleteProgress,
-    deleted_emails:   renderDeletedEmails,
-    deleted_senders:  renderDeletedSenders,
-    human_verify:     renderHumanVerify,
-    import_session:   renderImportSession,
-  }[msg.type] || (() => {}))(msg.data);
+async function apiVerifyProtonSession(session) {
+  return apiFetch('/proton/verify-session', { method: 'POST', body: JSON.stringify(session) });
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-function esc(s) {
-  return String(s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function kbd(k) { return `<kbd>${k}</kbd>`; }
-
-function setHeader(t) { document.getElementById('header').textContent = t; }
-function setStatus(t)  { document.getElementById('status').textContent = t; }
-function setFooter(h)  { document.getElementById('footer').innerHTML = h; }
-function setContent(h) { document.getElementById('content').innerHTML = h; }
-
-function scrollCursor() {
-  requestAnimationFrame(() => {
-    const el = document.querySelector('.cursor-row');
-    if (el) el.scrollIntoView({ block: 'nearest' });
+async function apiDeleteMessages(session, ids) {
+  return apiFetch('/proton/delete', {
+    method: 'POST',
+    body: JSON.stringify({ ...session, ids }),
   });
 }
 
-// ── accounts screen ──────────────────────────────────────────────────────────
+// ─── IndexedDB ────────────────────────────────────────────────────────────────
 
-function renderAccounts(d) {
-  hideFilterBar();
-  setHeader(`Mail Spam Toolkit  —  Accounts (${d.total})`);
-  setStatus('');
-  setFooter(
-    kbd('↑↓')+' Navigate &nbsp; '+
-    kbd('N')+' New account &nbsp; '+
-    kbd('D')+' Toggle disable &nbsp; '+
-    kbd('B')+' Back'
-  );
+const IDB_VERSION = 1;
 
-  let rows = '';
-  for (const r of d.rows) {
-    const cur      = r.is_cursor ? 'cursor-row' : '';
-    const disabled = r.disabled
-      ? '<span class="coming-soon">disabled</span>'
-      : '<span class="check-on">✓ active</span>';
-    rows += `<tr class="${cur}">
-      <td class="c-sender">${esc(r.name)}</td>
-      <td class="c-unsub" style="width:120px;text-align:left">${esc(r.provider)}</td>
-      <td class="c-emails" style="width:120px;text-align:left">${disabled}</td>
-    </tr>`;
-  }
-
-  setContent(`<table class="data-table">
-    <thead><tr>
-      <th class="c-sender">Account</th>
-      <th style="width:120px">Provider</th>
-      <th style="width:120px">Status</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>`);
-  scrollCursor();
-}
-
-// ── account setup screen ─────────────────────────────────────────────────────
-
-function renderAccountSetup(d) {
-  hideFilterBar();
-  setHeader('Mail Spam Toolkit  —  Account Setup');
-  setStatus('');
-
-  const errorHtml = d.error ? `<div class="auth-error">${esc(d.error)}</div>` : '';
-
-  if (d.step === 'provider') {
-    setFooter(kbd('1') + ' Select Protonmail');
-    setContent(`<div class="action-screen">
-      <div class="action-title">Set up your first account</div>
-      <div class="action-subtitle">Select mail provider</div>
-      <div class="server-list">
-        <div class="server-item" onclick="send('1')">
-          <span class="server-key">${kbd('1')}</span>
-          <span class="server-name">Protonmail</span>
-        </div>
-        <div class="server-item server-item-disabled">
-          <span class="server-key">${kbd('2')}</span>
-          <span class="server-name">Gmail</span>
-          <span class="coming-soon">Coming soon</span>
-        </div>
-      </div>
-    </div>`);
-  } else {
-    setFooter(kbd('Enter') + ' Create &nbsp; ' + kbd('Esc') + ' Back');
-    setContent(`<div class="action-screen">
-      <div class="action-title">New <span class="action-sender">${esc(d.provider)}</span> account</div>
-      <div class="action-body">
-        Choose a name for this account. A folder with this name will be created inside <code>data/</code>.<br>
-        Place your <b>.eml</b> files there and restart the app to load them.<br><br>
-        Letters, numbers, and <code>. _ @ + -</code> allowed — no spaces.
-      </div>
-      ${errorHtml}
-      <div class="auth-form">
-        <div class="auth-field">
-          <label class="auth-label">Account name</label>
-          <input id="account-name" type="text" class="auth-input"
-                 placeholder="e.g. user@mail.com" maxlength="100"
-                 spellcheck="false" autocomplete="off">
-        </div>
-      </div>
-    </div>`);
-    requestAnimationFrame(() => {
-      const el = document.getElementById('account-name');
-      if (el) el.focus();
-    });
-  }
-}
-
-// ── loading screen ───────────────────────────────────────────────────────────
-
-function renderLoading(d) {
-  hideFilterBar();
-  setHeader('Mail Spam Toolkit');
-  setStatus('');
-  setFooter('');
-  const pct = d.total > 0 ? Math.min(100, Math.round(d.current / d.total * 100)) : 0;
-  setContent(`<div class="loading-screen">
-    <div class="loading-title">Loading data…</div>
-    <div class="loading-msg">${esc(d.message)}</div>
-    <div class="loading-bar-wrap">
-      <div class="loading-bar-fill" style="width:${pct}%"></div>
-    </div>
-    <div class="loading-pct">${pct}%</div>
-  </div>`);
-}
-
-// ── senders screen ───────────────────────────────────────────────────────────
-
-let _sendersData = null;
-
-function clickRow(idx) { sendGoto(idx); }
-
-function renderSendersTable(d) {
-  const filter = (document.getElementById('filter-input').value || '').toLowerCase();
-  let rows = '';
-  for (const r of d.rows) {
-    if (filter && !r.sender.toLowerCase().includes(filter)) continue;
-    const cur = r.is_cursor ? 'cursor-row' : '';
-    const ub  = r.unsubscribed
-      ? '<span class="check-on">✓</span>'
-      : '<span class="check-off">·</span>';
-    const cu  = r.can_unsubscribe
-      ? '<span class="can-unsub">(can unsubscribe)</span>' : '';
-    rows += `<tr class="${cur}" data-i="${r.index}" onclick="clickRow(${r.index})">
-      <td class="c-num">${r.num}</td>
-      <td class="c-unsub">${ub}</td>
-      <td class="c-sender">${esc(r.sender)}${cu}</td>
-      <td class="c-emails">${r.email_count}</td>
-    </tr>`;
-  }
-  const tbody = document.getElementById('senders-tbody');
-  if (tbody) {
-    tbody.innerHTML = rows;
-  } else {
-    setContent(`<table class="data-table">
-      <thead><tr>
-        <th class="c-num">#</th>
-        <th class="c-unsub">Unsubscribed</th>
-        <th class="c-sender">Sender</th>
-        <th class="c-emails">Emails</th>
-      </tr></thead>
-      <tbody id="senders-tbody">${rows}</tbody>
-    </table>`);
-  }
-  scrollCursor();
-}
-
-function renderSenders(d) {
-  if (d.open_url) window.open(d.open_url, '_blank', 'noopener');
-  _sendersData = d;
-  setHeader(`Mail Spam Toolkit  —  ${d.total_emails} emails  |  ${d.total} senders  |  ${d.unsub_count} unsubscribed`);
-  setStatus(d.status);
-  setFooter(
-    kbd('↑↓')+' Navigate &nbsp; '+
-    kbd('Enter')+' Emails &nbsp; '+
-    kbd('O')+' Open &nbsp; '+
-    kbd('S')+' Sender Analytics &nbsp; '+
-    kbd('A')+' Analytics &nbsp; '+
-    kbd('X')+' Deleted Senders &nbsp; '+
-    kbd('C')+' Accounts &nbsp; '+
-    kbd('Q')+' Quit'
-  );
-  document.getElementById('filter-bar').style.display = '';
-  renderSendersTable(d);
-}
-
-function hideFilterBar() {
-  const fb = document.getElementById('filter-bar');
-  if (fb) fb.style.display = 'none';
-}
-
-// ── emails screen ────────────────────────────────────────────────────────────
-
-let _emailsData = null;
-
-function renderEmailsTable(d) {
-  const filter = (document.getElementById('emails-filter')?.value || '').toLowerCase();
-  let rows = '';
-  for (const r of d.rows) {
-    if (filter && !r.subject.toLowerCase().includes(filter)) continue;
-    const cur      = r.is_cursor ? 'cursor-row' : '';
-    const check    = r.selected
-      ? '<span class="check-on">✓</span>'
-      : '<span class="check-off">○</span>';
-    const attBadge = r.has_attachments
-      ? ' <span class="att-badge">(has attachments)</span>' : '';
-    rows += `<tr class="${cur}" data-i="${r.index}">
-      <td class="c-check">${check}</td>
-      <td class="c-subject">${esc(r.subject)}${attBadge}</td>
-      <td class="c-date">${esc(r.date)}</td>
-    </tr>`;
-  }
-  const tbody = document.getElementById('emails-tbody');
-  if (tbody) {
-    tbody.innerHTML = rows;
-    scrollCursor();
-  }
-}
-
-function renderEmails(d) {
-  hideFilterBar();
-  _emailsData = d;
-  setHeader(`${esc(d.sender)}  —  ${d.selected_count}/${d.total} selected`);
-  setStatus(d.status);
-
-  const deleteHint = d.selected_count > 0
-    ? ' &nbsp; ' + kbd('D') + ' Delete in server'
-    : '';
-
-  setFooter(
-    kbd('↑↓')+' Navigate &nbsp; '+
-    kbd('Space')+' Select/Unselect &nbsp; '+
-    kbd('A')+' Select All &nbsp; '+
-    kbd('O')+' Attachments &nbsp; '+
-    kbd('S')+' Sender Analytics &nbsp; '+
-    kbd('B')+' Back' +
-    deleteHint
-  );
-
-  const preview = d.preview || '(no preview available)';
-  const prevFilter = document.getElementById('emails-filter')?.value || '';
-
-  const existingTbody = document.getElementById('emails-tbody');
-  if (existingTbody) {
-    renderEmailsTable(d);
-    const prevEl = document.getElementById('emails-preview');
-    if (prevEl) prevEl.textContent = preview;
-    return;
-  }
-
-  setContent(`<div class="split-layout">
-    <div class="emails-pane">
-      <div class="filter-bar" style="background:transparent;border:none;padding:6px 12px">
-        <input id="emails-filter" type="text" placeholder="Filter by subject…"
-               style="max-width:360px" spellcheck="false" autocomplete="off"
-               value="${esc(prevFilter)}">
-      </div>
-      <table class="data-table">
-        <thead><tr>
-          <th class="c-check"></th>
-          <th class="c-subject">Subject</th>
-          <th class="c-date">Date</th>
-        </tr></thead>
-        <tbody id="emails-tbody"></tbody>
-      </table>
-    </div>
-    <div class="preview-pane">
-      <div class="preview-label">Preview</div>
-      <div class="preview-body" id="emails-preview">${esc(preview)}</div>
-    </div>
-  </div>`);
-
-  renderEmailsTable(d);
-
-  document.getElementById('emails-filter').addEventListener('input', () => {
-    if (_emailsData) renderEmailsTable(_emailsData);
+async function openIdb(userId) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(`spam-toolkit-${userId}`, IDB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('senders')) {
+        db.createObjectStore('senders', { keyPath: 'email' });
+      }
+      if (!db.objectStoreNames.contains('emails')) {
+        const es = db.createObjectStore('emails', { keyPath: 'messageId' });
+        es.createIndex('senderEmail', 'senderEmail', { unique: false });
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = () => reject(req.error);
   });
 }
 
-// ── attachments screen ────────────────────────────────────────────────────────
-
-function renderAttachments(d) {
-  hideFilterBar();
-  setHeader(`Attachments  —  ${esc(d.subject)}`);
-  setStatus('');
-  setFooter(kbd('Esc')+' / '+kbd('B')+' Back to emails');
-
-  if (!d.attachments || d.attachments.length === 0) {
-    setContent(`<div class="att-screen"><p class="att-empty">No attachments could be extracted.</p></div>`);
-    return;
-  }
-
-  const rows = d.attachments.map(a => {
-    const size = a.size_bytes >= 1024
-      ? `${Math.round(a.size_bytes / 1024)} KB`
-      : `${a.size_bytes} B`;
-    return `<tr>
-      <td class="att-filename">
-        <a href="${esc(a.download_url)}" download="${esc(a.filename)}" class="att-dl-link">${esc(a.filename)}</a>
-      </td>
-      <td class="att-type">${esc(a.content_type)}</td>
-      <td class="att-size">${size}</td>
-    </tr>`;
-  }).join('');
-
-  setContent(`<div class="att-screen">
-    <p class="att-hint">Click a filename to download it.</p>
-    <table class="data-table att-table">
-      <thead><tr>
-        <th class="att-filename">Filename</th>
-        <th class="att-type">Type</th>
-        <th class="att-size">Size</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-  </div>`);
-}
-
-// ── server select screen ─────────────────────────────────────────────────────
-
-function renderImportSession(d) {
-  hideFilterBar();
-  removeCaptchaListener();
-  setHeader('Mail Spam Toolkit  —  Import Protonmail Session');
-  setStatus('');
-  setFooter(kbd('Enter') + ' Import &nbsp; ' + kbd('B') + ' Cancel');
-
-  const errorHtml = d.error ? `<div class="auth-error">${esc(d.error)}</div>` : '';
-
-  setContent(`<div class="action-screen">
-    <div class="action-title">Import session from browser</div>
-    <div class="action-body">
-      <b>How to get the cookie string:</b><br>
-      1. Open <b>mail.proton.me</b> (logged in) → F12 → Network tab<br>
-      2. Refresh the page → click any request to <b>mail.proton.me</b><br>
-      3. Headers → Request Headers → find <b>Cookie:</b><br>
-      4. Copy the full value and paste below
-    </div>
-    ${errorHtml}
-    <div class="auth-form">
-      <div class="auth-field">
-        <label class="auth-label">Cookie header value</label>
-        <input id="import-uid" type="password" class="auth-input"
-               placeholder="AUTH-xxx=eyJ...; Session-Id=..." spellcheck="false" autocomplete="off">
-      </div>
-    </div>
-  </div>`);
-
-  requestAnimationFrame(() => {
-    const el = document.getElementById('import-uid');
-    if (el) el.focus();
+function idbTx(store, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = S.db.transaction(store, mode);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    fn(tx.objectStore(store));
   });
 }
 
-function renderServerSelect(d) {
-  hideFilterBar();
-  removeCaptchaListener();
-  setHeader(`Mail Spam Toolkit  —  Delete in Server`);
-  setStatus('');
-  setFooter(kbd('Esc')+' / '+kbd('B')+' Cancel');
-
-  setContent(`<div class="action-screen">
-    <div class="action-title">Delete ${d.count} email(s) from <span class="action-sender">${esc(d.sender)}</span></div>
-    <div class="action-subtitle">Select mail server</div>
-    <div class="server-list">
-      <div class="server-item" onclick="send('1')">
-        <span class="server-key">${kbd('1')}</span>
-        <span class="server-name">Protonmail</span>
-      </div>
-      <div class="server-item server-item-disabled">
-        <span class="server-key">${kbd('2')}</span>
-        <span class="server-name">Gmail</span>
-        <span class="coming-soon">Coming soon</span>
-      </div>
-    </div>
-  </div>`);
+async function idbPutMany(store, items) {
+  if (!items.length) return;
+  return idbTx(store, 'readwrite', os => { for (const item of items) os.put(item); });
 }
 
-// ── auth prompt screen ───────────────────────────────────────────────────────
-
-function renderAuthPrompt(d) {
-  hideFilterBar();
-  setHeader(`Mail Spam Toolkit  —  Protonmail Authentication`);
-  setStatus('');
-  setFooter(kbd('Enter')+' Confirm &nbsp; '+kbd('Esc')+' Cancel');
-
-  const errorHtml = d.error
-    ? `<div class="auth-error">${esc(d.error)}</div>`
-    : '';
-
-  setContent(`<div class="action-screen">
-    <div class="action-title">Authenticate to delete ${d.count} email(s)</div>
-    ${errorHtml}
-    <div class="auth-form">
-      <div class="auth-field">
-        <label class="auth-label">Account</label>
-        <div class="auth-value">${esc(d.username || '(not configured)')}</div>
-      </div>
-      <div class="auth-field">
-        <label class="auth-label">Password</label>
-        <input id="auth-password" type="password" class="auth-input"
-               placeholder="Protonmail password…"
-               autocomplete="current-password" spellcheck="false">
-      </div>
-      <div class="auth-note">Password is sent only to Protonmail's API and never written to disk.</div>
-    </div>
-  </div>`);
-
-  requestAnimationFrame(() => {
-    const el = document.getElementById('auth-password');
-    if (el) el.focus();
+async function idbGetAll(store) {
+  return new Promise((resolve, reject) => {
+    const req = S.db.transaction(store, 'readonly').objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
   });
 }
 
-// ── human verify screen ──────────────────────────────────────────────────────
-
-let _hvMsgListener = null;
-
-function removeCaptchaListener() {
-  if (_hvMsgListener) {
-    window.removeEventListener('message', _hvMsgListener);
-    _hvMsgListener = null;
-  }
+async function idbGetByIndex(store, idx, value) {
+  return new Promise((resolve, reject) => {
+    const req = S.db.transaction(store, 'readonly').objectStore(store).index(idx).getAll(value);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
 }
 
-function renderHumanVerify(d) {
-  hideFilterBar();
-  setHeader('Mail Spam Toolkit  —  Human Verification');
-  setStatus('');
+async function idbClear(store) {
+  return idbTx(store, 'readwrite', os => os.clear());
+}
 
-  const hasCaptcha = d.methods && d.methods.includes('captcha');
-  const hasEmail   = d.methods && d.methods.includes('email');
-  const errorHtml  = d.email_error
-    ? `<div class="auth-error">${esc(d.email_error)}</div>` : '';
+async function idbPutOne(store, item) {
+  return idbTx(store, 'readwrite', os => os.put(item));
+}
 
-  if (!d.email_sent) {
-    // ── State 1: choose / trigger verification method ────────────────────────
-    setFooter(kbd('B') + ' Cancel');
+// ─── EML parser ───────────────────────────────────────────────────────────────
 
-    if (hasCaptcha && d.web_url) {
-      // Render iframe with proxy src
-      removeCaptchaListener();
-      const proxySrc = d.web_url.replace('https://verify.proton.me', '/captcha-proxy');
-
-      _hvMsgListener = (ev) => {
-        if (ev.origin && ev.origin.includes('proton')) {
-          console.log('[HV postMessage]', ev.origin, ev.data);
-        }
-        const data = ev.data;
-        if (!data) return;
-        let token = null;
-        let type  = 'captcha';
-        if (data && typeof data === 'object') {
-          if (data.type === 'pm_captcha') {
-            token = data.payload;
-          } else if (data.type === 'pm_human_verification') {
-            token = data.token || data.payload?.token;
-            type  = data.tokenType || data.payload?.type || 'captcha';
-          } else if (data.token) {
-            token = data.token;
+function decodeRfc2047(raw) {
+  if (!raw) return '';
+  return raw
+    .replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (_, charset, enc, text) => {
+      try {
+        let bytes;
+        if (enc.toUpperCase() === 'B') {
+          bytes = Uint8Array.from(atob(text), c => c.charCodeAt(0));
+        } else {
+          const s = text.replace(/_/g, ' ');
+          const arr = [];
+          let i = 0;
+          while (i < s.length) {
+            if (s[i] === '=' && i + 2 < s.length) {
+              arr.push(parseInt(s.slice(i + 1, i + 3), 16));
+              i += 3;
+            } else { arr.push(s.charCodeAt(i)); i++; }
           }
+          bytes = new Uint8Array(arr);
         }
-        if (token) {
-          removeCaptchaListener();
-          sendHvResult(token, type);
-        }
-      };
-      window.addEventListener('message', _hvMsgListener);
+        return new TextDecoder(charset).decode(bytes);
+      } catch { return text; }
+    })
+    // Remove whitespace between adjacent encoded words
+    .replace(/\?=\s+=\?/g, '');
+}
 
-      setContent(`<div class="action-screen">
-        <div class="action-title">Complete the CAPTCHA to continue</div>
-        <div class="action-body">
-          Solve the challenge below to delete <b>${d.count}</b> email(s) from <b>${esc(d.sender)}</b>.
-        </div>
-        ${errorHtml}
-        <iframe src="${proxySrc}" class="captcha-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
-      </div>`);
+function parseHeaders(text) {
+  const h = {};
+  let cur = null;
+  for (const line of text.split('\n')) {
+    if (/^[ \t]/.test(line)) {
+      if (cur) h[cur] = (h[cur] || '') + ' ' + line.trim();
     } else {
-      // Fallback: show available method buttons
-      let footerParts = [];
-      if (hasEmail) footerParts.push(kbd('1') + ' Send email code');
-      footerParts.push(kbd('B') + ' Cancel');
-      setFooter(footerParts.join(' &nbsp; '));
+      const idx = line.indexOf(':');
+      if (idx > 0) {
+        cur = line.slice(0, idx).toLowerCase().trim();
+        h[cur] = line.slice(idx + 1).trim();
+      }
+    }
+  }
+  return h;
+}
 
-      let methodsHtml = '';
-      if (hasEmail) {
-        methodsHtml += `<button class="auth-btn" onclick="send('1')">Send email code</button>`;
+function extractEmail(from) {
+  if (!from) return '';
+  const angled = from.match(/<([^\s@<>]+@[^\s@<>]+)>/);
+  if (angled) return angled[1].toLowerCase();
+  const bare = from.match(/([^\s@<>"']+@[^\s@<>"']+)/);
+  return bare ? bare[1].toLowerCase() : from.toLowerCase().trim();
+}
+
+function extractUnsubscribeUrl(header) {
+  if (!header) return null;
+  const m = header.match(/<(https?:[^>]+)>/);
+  return m ? m[1] : null;
+}
+
+function parseIsoDate(raw) {
+  if (!raw) return '';
+  try {
+    const d = new Date(raw);
+    return isNaN(d) ? '' : d.toISOString().slice(0, 10);
+  } catch { return ''; }
+}
+
+function extractPreview(emlText, headers) {
+  const sep = emlText.includes('\r\n') ? '\r\n' : '\n';
+  const dbl = sep + sep;
+  const ct = headers['content-type'] || '';
+  const boundary = (ct.match(/boundary=["']?([^"';\s\r\n]+)["']?/i) || [])[1];
+
+  if (boundary) {
+    const parts = emlText.split(`--${boundary}`);
+    for (const part of parts) {
+      const pi = part.indexOf(dbl);
+      if (pi < 0) continue;
+      const ph = parseHeaders(part.slice(0, pi));
+      const pct = ph['content-type'] || '';
+      if (pct.startsWith('text/plain')) {
+        return part.slice(pi + dbl.length, pi + dbl.length + 800).trim().slice(0, 400);
+      }
+    }
+    return '';
+  }
+
+  const bodyStart = emlText.indexOf(dbl);
+  if (bodyStart < 0) return '';
+  return emlText.slice(bodyStart + dbl.length, bodyStart + dbl.length + 800).trim().slice(0, 400);
+}
+
+async function parseEmlFile(handle) {
+  const file = await handle.getFile();
+  // Read first 6 KB for header parsing
+  const headerSlice = await file.slice(0, 6144).text();
+  const sep = headerSlice.includes('\r\n') ? '\r\n' : '\n';
+  const dbl = sep + sep;
+  const hEnd = headerSlice.indexOf(dbl);
+  const headerText = hEnd >= 0 ? headerSlice.slice(0, hEnd) : headerSlice;
+  const headers = parseHeaders(headerText);
+
+  const from = extractEmail(decodeRfc2047(headers['from'] || ''));
+  const subject = (decodeRfc2047(headers['subject'] || '')).trim() || '(no subject)';
+  const date = parseIsoDate(headers['date'] || '');
+  const messageId = (headers['message-id'] || '').replace(/[<>\s]/g, '') || handle.name;
+  const unsubscribeUrl = extractUnsubscribeUrl(headers['list-unsubscribe'] || '');
+
+  // For preview, read full file
+  let preview = null;
+  try {
+    const full = await file.text();
+    preview = extractPreview(full, headers);
+  } catch { /* skip preview on error */ }
+
+  return { from, subject, date, messageId, unsubscribeUrl, preview, protonId: null };
+}
+
+async function parseMetadataJson(handle) {
+  const file = await handle.getFile();
+  const raw = JSON.parse(await file.text());
+  const p = raw.Payload || {};
+  return {
+    from: (p.Sender?.Address || '').toLowerCase(),
+    fromName: p.Sender?.Name || '',
+    subject: p.Subject || '(no subject)',
+    date: p.Time ? new Date(p.Time * 1000).toISOString().slice(0, 10) : '',
+    messageId: p.ExternalID || p.ID || '',
+    protonId: p.ID || null,
+    unsubscribeUrl: null,
+    preview: null,
+  };
+}
+
+// ─── Directory walking ────────────────────────────────────────────────────────
+
+async function* walkDir(dirHandle) {
+  for await (const [, handle] of dirHandle.entries()) {
+    if (handle.kind === 'file') {
+      yield handle;
+    } else if (handle.kind === 'directory') {
+      yield* walkDir(handle);
+    }
+  }
+}
+
+async function collectFiles(dirHandle) {
+  const eml = {};
+  for await (const handle of walkDir(dirHandle)) {
+    const name = handle.name;
+    if (name.endsWith('.metadata.json')) {
+      const base = name.slice(0, -'.metadata.json'.length);
+      eml[base] = eml[base] || {};
+      eml[base].meta = handle;
+    } else if (name.endsWith('.eml')) {
+      const base = name.slice(0, -'.eml'.length);
+      eml[base] = eml[base] || {};
+      eml[base].eml = handle;
+    }
+  }
+  return eml;
+}
+
+// ─── Import ───────────────────────────────────────────────────────────────────
+
+async function runImport(dirHandle) {
+  S.importState = { total: 0, done: 0, running: true, cancelled: false };
+  renderScreen();
+
+  // Phase 1: collect file handles
+  updateImportProgress('Scanning directory…', 0, 0);
+  const files = await collectFiles(dirHandle);
+  const entries = Object.entries(files);
+  S.importState.total = entries.length;
+
+  if (!entries.length) {
+    S.importState.running = false;
+    showNotification('No .eml or .metadata.json files found in the selected folder.', 'error');
+    renderScreen();
+    return;
+  }
+
+  // Phase 2: clear old data and process
+  await idbClear('emails');
+  await idbClear('senders');
+  S.fileHandles.clear();
+
+  const emailBatch = [];
+  const sendersMap = {};
+  const BATCH = 100;
+
+  for (let i = 0; i < entries.length; i++) {
+    if (S.importState.cancelled) break;
+
+    const [, handles] = entries[i];
+    try {
+      let rec = null;
+      if (handles.meta) {
+        rec = await parseMetadataJson(handles.meta);
+      } else if (handles.eml) {
+        rec = await parseEmlFile(handles.eml);
       }
 
-      setContent(`<div class="action-screen">
-        <div class="action-title">Human Verification Required</div>
-        <div class="action-body">
-          Protonmail requires identity verification before deleting
-          <b>${d.count}</b> email(s) from <b>${esc(d.sender)}</b>.<br><br>
-          Available methods: <b>${(d.methods || []).join(', ') || 'none'}</b>
-        </div>
-        ${errorHtml}
-        <div class="auth-form">${methodsHtml}</div>
-      </div>`);
+      if (rec && rec.from) {
+        const emailRecord = {
+          messageId: rec.messageId || `${rec.from}-${i}`,
+          protonId: rec.protonId || null,
+          senderEmail: rec.from,
+          senderName: rec.fromName || '',
+          subject: rec.subject,
+          date: rec.date,
+          unsubscribeUrl: rec.unsubscribeUrl || null,
+          preview: rec.preview || null,
+          deleted: false,
+        };
+        emailBatch.push(emailRecord);
+
+        if (handles.eml) S.fileHandles.set(emailRecord.messageId, handles.eml);
+
+        const s = sendersMap[rec.from] || {
+          email: rec.from,
+          name: rec.fromName || '',
+          count: 0,
+          unsubscribeUrl: rec.unsubscribeUrl || null,
+          lastDate: '',
+          firstDate: '',
+        };
+        s.count++;
+        if (!s.lastDate || rec.date > s.lastDate) s.lastDate = rec.date;
+        if (!s.firstDate || (rec.date && rec.date < s.firstDate)) s.firstDate = rec.date;
+        if (!s.unsubscribeUrl && rec.unsubscribeUrl) s.unsubscribeUrl = rec.unsubscribeUrl;
+        sendersMap[rec.from] = s;
+      }
+    } catch { /* skip unparseable file */ }
+
+    S.importState.done = i + 1;
+
+    if ((i + 1) % BATCH === 0) {
+      await idbPutMany('emails', emailBatch.splice(0));
+      updateImportProgress('Parsing files…', i + 1, entries.length);
+      await sleep(0);
     }
-  } else {
-    // ── State 2: email code sent — let user enter it ─────────────────────────
-    removeCaptchaListener();
-    setFooter(kbd('Enter') + ' Submit &nbsp; ' + kbd('B') + ' Cancel');
+  }
 
-    setContent(`<div class="action-screen">
-      <div class="action-title">Enter Verification Code</div>
-      <div class="action-body">
-        Protonmail sent a 6-digit code to your recovery email.<br>
-        Enter it below to delete <b>${d.count}</b> email(s) from <b>${esc(d.sender)}</b>.
-      </div>
-      ${errorHtml}
-      <div class="auth-form">
-        <div class="auth-field">
-          <label class="auth-label">Verification Code</label>
-          <input id="hv-code" type="text" class="auth-input"
-                 placeholder="123456" maxlength="6"
-                 autocomplete="one-time-code" spellcheck="false">
-        </div>
-      </div>
-    </div>`);
+  // Flush remaining
+  if (emailBatch.length) await idbPutMany('emails', emailBatch);
+  await idbPutMany('senders', Object.values(sendersMap));
 
-    requestAnimationFrame(() => {
-      const el = document.getElementById('hv-code');
-      if (el) el.focus();
+  S.importState.running = false;
+  S.importState.done = entries.length;
+
+  if (!S.importState.cancelled) {
+    showNotification(`Import complete — ${Object.keys(sendersMap).length} senders, ${entries.length} emails`, 'success');
+    await navigateTo('senders');
+  }
+}
+
+function updateImportProgress(msg, done, total) {
+  const label = document.getElementById('import-label');
+  const fill = document.getElementById('import-fill');
+  const pct = document.getElementById('import-pct');
+  if (label) label.textContent = msg;
+  if (fill && total > 0) {
+    fill.style.width = `${Math.round((done / total) * 100)}%`;
+    fill.classList.remove('indeterminate');
+  }
+  if (pct) pct.textContent = total > 0 ? `${done} / ${total}` : '';
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ─── Notification toast ───────────────────────────────────────────────────────
+
+function showNotification(msg, type = 'info') {
+  const el = document.getElementById('notification');
+  if (!el) return;
+  el.className = `alert alert-${type}`;
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+// ─── Navigation ───────────────────────────────────────────────────────────────
+
+async function navigateTo(screen, params = {}) {
+  S.screen = screen;
+  S.selectedEmailIds = new Set();
+  S.previewEmail = null;
+  S.filterEmails = '';
+  S.filterSenders = '';
+
+  if (screen === 'senders') {
+    S.senders = await idbGetAll('senders');
+    S.senders.sort((a, b) => b.count - a.count);
+    S.filteredSenders = [...S.senders];
+  }
+  if (screen === 'emails' && params.sender) {
+    S.selectedSender = params.sender;
+    S.emails = await idbGetByIndex('emails', 'senderEmail', params.sender.email);
+    S.emails.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    S.filteredEmails = [...S.emails];
+  }
+  if (screen === 'delete' && params.sender) {
+    S.selectedSender = params.sender;
+    S.emails = await idbGetByIndex('emails', 'senderEmail', params.sender.email);
+    S.emails.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    // Pre-select undeletable emails that have a protonId
+    S.selectedEmailIds = new Set(
+      S.emails.filter(e => !e.deleted && e.protonId).map(e => e.messageId)
+    );
+    S.sessionValid = null;
+    S.protonSession = null;
+    S.deleteLog = [];
+    S.deleteDone = false;
+    S.deleteInProgress = false;
+  }
+
+  renderScreen();
+}
+
+// ─── Rendering ────────────────────────────────────────────────────────────────
+
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else if (k === 'class') el.className = v;
+    else if (k === 'html') el.innerHTML = v;
+    else el.setAttribute(k, v);
+  }
+  for (const c of children) {
+    if (c == null) continue;
+    el.append(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return el;
+}
+
+function renderScreen() {
+  const app = document.getElementById('app');
+  if (!app) return;
+  app.innerHTML = '';
+
+  if (S.screen === 'auth') {
+    app.appendChild(renderAuthScreen());
+    return;
+  }
+
+  // All other screens need auth
+  app.appendChild(renderTopBar());
+  const notif = h('div', { id: 'notification', class: 'alert alert-info', hidden: true });
+  notif.style.cssText = 'position:fixed;top:60px;right:16px;z-index:200;max-width:420px;';
+  app.appendChild(notif);
+
+  const main = document.createElement('div');
+  switch (S.screen) {
+    case 'home':    main.appendChild(renderHome()); break;
+    case 'import':  main.appendChild(renderImportScreen()); break;
+    case 'senders': renderSendersScreen(main); break;
+    case 'emails':  renderEmailsScreen(main); break;
+    case 'delete':  main.appendChild(renderDeleteScreen()); break;
+    default:        main.textContent = '404';
+  }
+  app.appendChild(main);
+}
+
+// ── Top bar ───────────────────────────────────────────────────────────────────
+
+function renderTopBar() {
+  const nav = h('nav', {});
+  const links = [
+    { label: 'Home', screen: 'home' },
+    { label: 'Senders', screen: 'senders' },
+    { label: 'Import', screen: 'import' },
+  ];
+  for (const { label, screen } of links) {
+    const a = h('a', {
+      href: '#',
+      class: S.screen === screen ? 'active' : '',
+      onclick: e => { e.preventDefault(); navigateTo(screen); },
+    }, label);
+    nav.appendChild(a);
+  }
+
+  return h('div', { class: 'top-bar' },
+    h('span', { class: 'brand' }, 'mail-spam-toolkit'),
+    nav,
+    h('div', { class: 'user-area' },
+      h('span', {}, S.userEmail || ''),
+      h('button', { class: 'btn btn-ghost btn-sm', onclick: logout }, 'Logout'),
+    ),
+  );
+}
+
+// ── Auth screen ───────────────────────────────────────────────────────────────
+
+function renderAuthScreen() {
+  const wrap = h('div', { class: 'auth-wrap' },
+    h('div', { class: 'auth-brand' }, 'mail-spam-toolkit'),
+    h('div', { class: 'auth-tagline' }, 'private · client-side · multi-user'),
+  );
+
+  const card = h('div', { class: 'auth-card' });
+
+  const tabs = h('div', { class: 'auth-tabs' });
+  const tabLogin = h('button', { class: `auth-tab ${S.authMode === 'login' ? 'active' : ''}`,
+    onclick: () => { S.authMode = 'login'; renderScreen(); } }, 'Login');
+  const tabReg = h('button', { class: `auth-tab ${S.authMode === 'register' ? 'active' : ''}`,
+    onclick: () => { S.authMode = 'register'; renderScreen(); } }, 'Register');
+  tabs.append(tabLogin, tabReg);
+
+  const emailField = h('div', { class: 'form-group' },
+    h('label', { class: 'form-label' }, 'Email'),
+    h('input', { id: 'auth-email', class: 'form-input', type: 'email', autocomplete: 'email', placeholder: 'you@example.com' }),
+  );
+  const pwField = h('div', { class: 'form-group' },
+    h('label', { class: 'form-label' }, 'Password'),
+    h('input', { id: 'auth-pw', class: 'form-input', type: 'password',
+      autocomplete: S.authMode === 'login' ? 'current-password' : 'new-password',
+      placeholder: S.authMode === 'register' ? 'Min. 8 characters' : '' }),
+  );
+  const errEl = h('div', { id: 'auth-err', class: 'alert alert-error', hidden: true });
+  const submitBtn = h('button', {
+    class: 'btn btn-primary',
+    style: 'width:100%;justify-content:center;',
+    onclick: handleAuthSubmit,
+  }, S.authMode === 'login' ? 'Login' : 'Create account');
+
+  card.append(tabs, emailField, pwField, errEl, submitBtn);
+  wrap.appendChild(card);
+
+  // Allow Enter key to submit
+  setTimeout(() => {
+    const inputs = card.querySelectorAll('.form-input');
+    inputs.forEach(inp => inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') handleAuthSubmit();
+    }));
+  }, 0);
+
+  return wrap;
+}
+
+async function handleAuthSubmit() {
+  const email = document.getElementById('auth-email')?.value?.trim() || '';
+  const password = document.getElementById('auth-pw')?.value || '';
+  const errEl = document.getElementById('auth-err');
+
+  const setErr = msg => { if (errEl) { errEl.textContent = msg; errEl.hidden = !msg; } };
+  setErr('');
+
+  if (!email || !password) { setErr('Email and password are required.'); return; }
+
+  const btn = document.querySelector('.auth-card .btn-primary');
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+
+  try {
+    const res = S.authMode === 'login'
+      ? await apiLogin(email, password)
+      : await apiRegister(email, password);
+
+    localStorage.setItem('mst_token', res.token);
+    initFromToken(res.token);
+    S.userEmail = res.user.email;
+    S.db = await openIdb(S.userId);
+    navigateTo('home');
+  } catch (err) {
+    setErr(err.message);
+    if (btn) { btn.disabled = false; btn.textContent = S.authMode === 'login' ? 'Login' : 'Create account'; }
+  }
+}
+
+// ── Home screen ───────────────────────────────────────────────────────────────
+
+function renderHome() {
+  const wrap = h('div', { class: 'main-content' });
+  wrap.appendChild(h('div', { class: 'section-title' }, 'Dashboard'));
+
+  // Stats
+  const stats = h('div', { class: 'stats-row' });
+  idbGetAll('senders').then(senders => {
+    const totalEmails = senders.reduce((s, r) => s + r.count, 0);
+    stats.innerHTML = '';
+    stats.append(
+      h('div', { class: 'stat-card' },
+        h('div', { class: 'stat-num' }, senders.length.toLocaleString()),
+        h('div', { class: 'stat-label' }, 'Senders'),
+      ),
+      h('div', { class: 'stat-card' },
+        h('div', { class: 'stat-num' }, totalEmails.toLocaleString()),
+        h('div', { class: 'stat-label' }, 'Emails indexed'),
+      ),
+    );
+  });
+  wrap.appendChild(stats);
+
+  const actions = h('div', { class: 'home-actions' });
+  actions.append(
+    h('button', { class: 'btn btn-primary', onclick: () => navigateTo('senders') }, 'Browse Senders'),
+    h('button', { class: 'btn btn-ghost', onclick: () => navigateTo('import') }, 'Import / Refresh'),
+  );
+  wrap.appendChild(actions);
+
+  return wrap;
+}
+
+// ── Import screen ─────────────────────────────────────────────────────────────
+
+function renderImportScreen() {
+  const wrap = h('div', { class: 'main-content' });
+
+  if (S.importState.running) {
+    const prog = h('div', { class: 'import-wrap' },
+      h('div', { class: 'import-title' }, 'Importing…'),
+      h('div', { class: 'progress-wrap' },
+        h('div', { class: 'progress-label' },
+          h('span', { id: 'import-label' }, 'Scanning directory…'),
+          h('span', { id: 'import-pct' }, ''),
+        ),
+        h('div', { class: 'progress-bar-track' },
+          h('div', { id: 'import-fill', class: 'progress-bar-fill indeterminate', style: 'width:0%' }),
+        ),
+      ),
+      h('button', { class: 'btn btn-ghost', onclick: () => { S.importState.cancelled = true; } }, 'Cancel'),
+    );
+    wrap.appendChild(prog);
+    return wrap;
+  }
+
+  const dropZone = h('div', { class: 'import-drop-zone', id: 'drop-zone' },
+    h('div', { class: 'import-drop-icon' }, '📁'),
+    h('div', { class: 'import-drop-text' }, h('strong', {}, 'Choose your email export folder')),
+    h('div', { class: 'import-drop-text' }, 'Select the folder containing your .eml files'),
+    h('button', { class: 'btn btn-primary', onclick: handlePickDirectory }, 'Choose Folder'),
+  );
+
+  const fallback = h('p', { style: 'font-size:12px;color:var(--text-dim);max-width:520px;text-align:center;margin-top:4px;' },
+    'Supports Protonmail Export and standard .eml files. ' +
+    'Your emails are processed locally in the browser — no files are uploaded.'
+  );
+
+  // Fallback for browsers without File System Access API
+  if (!('showDirectoryPicker' in window)) {
+    dropZone.innerHTML = '';
+    const fileInput = h('input', {
+      type: 'file',
+      accept: '.eml,.json',
+      multiple: true,
+      style: 'display:none',
+      id: 'file-fallback',
     });
+    fileInput.addEventListener('change', handleFileFallback);
+    dropZone.append(
+      h('div', { class: 'import-drop-icon' }, '📄'),
+      h('div', { class: 'import-drop-text' }, h('strong', {}, 'Select .eml files')),
+      h('button', { class: 'btn btn-primary', onclick: () => fileInput.click() }, 'Choose Files'),
+      fileInput,
+    );
+  }
+
+  wrap.appendChild(h('div', { class: 'import-wrap' },
+    h('div', { class: 'import-title' }, 'Import Emails'),
+    h('div', { class: 'import-sub' },
+      'Select your local email export directory. Files are read directly in your browser — nothing is uploaded to the server.',
+    ),
+    dropZone,
+    fallback,
+  ));
+
+  return wrap;
+}
+
+async function handlePickDirectory() {
+  try {
+    const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+    await runImport(dirHandle);
+  } catch (err) {
+    if (err.name !== 'AbortError') showNotification(err.message, 'error');
   }
 }
 
-// ── delete progress screen ───────────────────────────────────────────────────
+async function handleFileFallback(e) {
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
 
-function renderDeleteProgress(d) {
-  hideFilterBar();
-  setHeader(`Mail Spam Toolkit  —  Deleting from Protonmail`);
-  setStatus('');
-  setFooter(d.complete ? kbd('B')+' Back' : 'Deleting…');
+  S.importState = { total: files.length, done: 0, running: true, cancelled: false };
+  renderScreen();
 
-  const pct = d.total > 0 ? Math.round(d.done / d.total * 100) : 0;
+  await idbClear('emails');
+  await idbClear('senders');
+  S.fileHandles.clear();
 
-  let msg = '';
-  if (d.error) {
-    msg = `<div class="del-error">Error: ${esc(d.error)}</div>`;
-  } else if (d.complete) {
-    const errNote = d.errors > 0 ? ` (${d.errors} could not be found on server)` : '';
-    msg = `<div class="del-success">Done — ${d.done} of ${d.total} emails deleted${errNote}.</div>`;
+  const emailBatch = [];
+  const sendersMap = {};
+  const metaMap = {};
+
+  // First pass: collect metadata.json
+  for (const file of files) {
+    if (file.name.endsWith('.metadata.json')) {
+      try {
+        const raw = JSON.parse(await file.text());
+        const p = raw.Payload || {};
+        const base = file.name.slice(0, -'.metadata.json'.length);
+        metaMap[base] = p;
+      } catch { /* skip */ }
+    }
+  }
+
+  // Second pass: process .eml files
+  let i = 0;
+  for (const file of files) {
+    if (!file.name.endsWith('.eml')) { i++; continue; }
+    if (S.importState.cancelled) break;
+
+    const base = file.name.slice(0, -'.eml'.length);
+    const meta = metaMap[base];
+
+    try {
+      let rec;
+      if (meta) {
+        rec = {
+          from: (meta.Sender?.Address || '').toLowerCase(),
+          fromName: meta.Sender?.Name || '',
+          subject: meta.Subject || '(no subject)',
+          date: meta.Time ? new Date(meta.Time * 1000).toISOString().slice(0, 10) : '',
+          messageId: meta.ExternalID || meta.ID || file.name,
+          protonId: meta.ID || null,
+          unsubscribeUrl: null,
+          preview: null,
+        };
+      } else {
+        const text = await file.slice(0, 6144).text();
+        const sep = text.includes('\r\n') ? '\r\n' : '\n';
+        const dbl = sep + sep;
+        const he = text.indexOf(dbl);
+        const headers = parseHeaders(he >= 0 ? text.slice(0, he) : text);
+        rec = {
+          from: extractEmail(decodeRfc2047(headers['from'] || '')),
+          fromName: '',
+          subject: (decodeRfc2047(headers['subject'] || '')).trim() || '(no subject)',
+          date: parseIsoDate(headers['date'] || ''),
+          messageId: (headers['message-id'] || '').replace(/[<>\s]/g, '') || file.name,
+          protonId: null,
+          unsubscribeUrl: extractUnsubscribeUrl(headers['list-unsubscribe'] || ''),
+          preview: null,
+        };
+      }
+
+      if (rec.from) {
+        const emailRecord = {
+          messageId: rec.messageId,
+          protonId: rec.protonId,
+          senderEmail: rec.from,
+          senderName: rec.fromName || '',
+          subject: rec.subject,
+          date: rec.date,
+          unsubscribeUrl: rec.unsubscribeUrl || null,
+          preview: rec.preview,
+          deleted: false,
+        };
+        emailBatch.push(emailRecord);
+
+        const s = sendersMap[rec.from] || { email: rec.from, name: rec.fromName || '', count: 0,
+          unsubscribeUrl: rec.unsubscribeUrl || null, lastDate: '', firstDate: '' };
+        s.count++;
+        if (!s.lastDate || rec.date > s.lastDate) s.lastDate = rec.date;
+        if (!s.firstDate || (rec.date && rec.date < s.firstDate)) s.firstDate = rec.date;
+        sendersMap[rec.from] = s;
+      }
+    } catch { /* skip */ }
+
+    S.importState.done = ++i;
+    if (i % 100 === 0) {
+      await idbPutMany('emails', emailBatch.splice(0));
+      updateImportProgress('Parsing files…', i, files.length);
+      await sleep(0);
+    }
+  }
+
+  if (emailBatch.length) await idbPutMany('emails', emailBatch);
+  await idbPutMany('senders', Object.values(sendersMap));
+  S.importState.running = false;
+
+  if (!S.importState.cancelled) {
+    showNotification(`Import complete — ${Object.keys(sendersMap).length} senders`, 'success');
+    await navigateTo('senders');
+  }
+}
+
+// ── Senders screen ────────────────────────────────────────────────────────────
+
+function renderSendersScreen(container) {
+  if (!S.senders.length) {
+    container.className = 'main-content';
+    container.appendChild(h('div', { class: 'empty-state' },
+      h('div', { class: 'empty-icon' }, '📬'),
+      h('div', { class: 'empty-text' }, 'No emails imported yet.'),
+      h('button', { class: 'btn btn-primary', onclick: () => navigateTo('import') }, 'Import Emails'),
+    ));
+    return;
+  }
+
+  container.className = '';
+
+  const toolbar = h('div', { class: 'toolbar' },
+    h('input', {
+      class: 'form-input filter-input',
+      type: 'text',
+      placeholder: 'Filter senders…',
+      value: S.filterSenders,
+      oninput: e => {
+        S.filterSenders = e.target.value.toLowerCase();
+        applyFilterSenders();
+      },
+    }),
+    h('span', { class: 'toolbar-spacer' }),
+    h('span', { class: 'selection-info' }, `${S.filteredSenders.length} senders`),
+  );
+
+  const tableWrap = h('div', { class: 'table-wrap list-pane', style: 'height:calc(100vh - 52px - 50px);overflow-y:auto;' });
+  const table = h('table', { class: 'data-table' });
+  const thead = h('thead', {},
+    h('tr', {},
+      h('th', { class: 'col-num' }, '#'),
+      h('th', { class: 'col-fill' }, 'Sender'),
+      h('th', { class: 'col-count' }, 'Emails'),
+      h('th', { class: 'col-date' }, 'Last'),
+      h('th', { class: 'col-badge' }, 'Unsub'),
+    ),
+  );
+  table.appendChild(thead);
+
+  const tbody = buildSendersBody();
+  table.appendChild(tbody);
+  tableWrap.appendChild(table);
+  container.append(toolbar, tableWrap);
+}
+
+function buildSendersBody() {
+  const tbody = document.createElement('tbody');
+  S.filteredSenders.forEach((s, i) => {
+    const tr = h('tr', {
+      onclick: () => navigateTo('emails', { sender: s }),
+    },
+      h('td', { class: 'col-num' }, String(i + 1)),
+      h('td', { class: 'col-fill', style: 'overflow:hidden;text-overflow:ellipsis;' }, s.email),
+      h('td', { class: 'col-count', style: 'text-align:right;' },
+        h('span', { class: 'count-badge' }, String(s.count)),
+      ),
+      h('td', { class: 'col-date', style: 'color:var(--text-dim);font-size:12px;' }, s.lastDate || '—'),
+      h('td', { class: 'col-badge', style: 'text-align:center;' },
+        s.unsubscribeUrl
+          ? h('a', { class: 'unsub-link', href: s.unsubscribeUrl, target: '_blank',
+              onclick: e => e.stopPropagation() }, 'unsub')
+          : h('span', { style: 'color:var(--text-muted);font-size:11px;' }, '—'),
+      ),
+    );
+    tbody.appendChild(tr);
+  });
+  return tbody;
+}
+
+function applyFilterSenders() {
+  const q = S.filterSenders;
+  S.filteredSenders = q ? S.senders.filter(s => s.email.includes(q)) : [...S.senders];
+  const tbody = document.querySelector('.data-table tbody');
+  if (tbody) tbody.replaceWith(buildSendersBody());
+  const info = document.querySelector('.selection-info');
+  if (info) info.textContent = `${S.filteredSenders.length} senders`;
+}
+
+// ── Emails screen ─────────────────────────────────────────────────────────────
+
+function renderEmailsScreen(container) {
+  container.className = '';
+  const sender = S.selectedSender;
+  if (!sender) return;
+
+  const toolbar = h('div', { class: 'toolbar' },
+    h('button', { class: 'btn btn-ghost btn-sm', onclick: () => navigateTo('senders') }, '← Back'),
+    h('strong', { style: 'font-size:13px;color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px;' }, sender.email),
+    h('input', {
+      class: 'form-input filter-input',
+      type: 'text',
+      placeholder: 'Filter emails…',
+      value: S.filterEmails,
+      oninput: e => {
+        S.filterEmails = e.target.value.toLowerCase();
+        applyFilterEmails();
+      },
+    }),
+    h('span', { class: 'toolbar-spacer' }),
+    h('button', { class: 'btn btn-ghost btn-sm',
+      onclick: () => {
+        if (S.selectedEmailIds.size === S.filteredEmails.length) {
+          S.selectedEmailIds.clear();
+        } else {
+          S.filteredEmails.forEach(e => S.selectedEmailIds.add(e.messageId));
+        }
+        refreshEmailsTable();
+        refreshDeleteBtn();
+      },
+    }, 'Toggle All'),
+    h('button', { id: 'delete-btn', class: 'btn btn-danger btn-sm',
+      disabled: S.selectedEmailIds.size === 0,
+      onclick: () => {
+        const toDelete = S.emails.filter(e => S.selectedEmailIds.has(e.messageId));
+        if (toDelete.some(e => e.protonId)) {
+          navigateTo('delete', { sender });
+        } else {
+          showNotification('Selected emails have no Protonmail ID. Cannot delete from server.', 'error');
+        }
+      },
+    }, `Delete selected (${S.selectedEmailIds.size})`),
+  );
+
+  const layout = h('div', { class: 'split-layout' });
+  const listPane = h('div', { class: 'list-pane', id: 'email-list-pane' });
+  const table = h('table', { class: 'data-table', id: 'email-table' });
+  table.appendChild(h('thead', {},
+    h('tr', {},
+      h('th', { class: 'col-check' }, ''),
+      h('th', { class: 'col-date' }, 'Date'),
+      h('th', { class: 'col-fill' }, 'Subject'),
+    ),
+  ));
+  table.appendChild(buildEmailsBody());
+  listPane.appendChild(table);
+
+  const previewPane = h('div', { class: 'preview-pane', id: 'preview-pane' },
+    h('div', { class: 'preview-empty', id: 'preview-empty' }, 'Select an email to preview'),
+  );
+
+  layout.append(toolbar, listPane, previewPane);
+  container.appendChild(layout);
+}
+
+function buildEmailsBody() {
+  const tbody = document.createElement('tbody');
+  S.filteredEmails.forEach(email => {
+    const checked = S.selectedEmailIds.has(email.messageId);
+    const tr = h('tr', { class: checked ? 'selected' : '' },
+      h('td', { class: 'col-check',
+        onclick: e => {
+          e.stopPropagation();
+          if (S.selectedEmailIds.has(email.messageId)) S.selectedEmailIds.delete(email.messageId);
+          else S.selectedEmailIds.add(email.messageId);
+          tr.className = S.selectedEmailIds.has(email.messageId) ? 'selected' : '';
+          refreshDeleteBtn();
+        },
+      },
+        h('span', { class: checked ? 'check-on' : 'check-off' }, checked ? '✓' : '○'),
+      ),
+      h('td', { class: 'col-date', style: 'color:var(--text-dim);font-size:12px;' },
+        email.deleted ? h('span', { class: 'deleted-label' }, 'deleted') : (email.date || '—')
+      ),
+      h('td', { class: 'col-fill', style: 'overflow:hidden;text-overflow:ellipsis;' },
+        email.subject,
+        email.deleted ? h('span', { class: 'deleted-label', style: 'margin-left:6px;' }, '✗') : null,
+      ),
+    );
+    tr.addEventListener('click', () => showPreview(email));
+    tbody.appendChild(tr);
+  });
+  return tbody;
+}
+
+function refreshEmailsTable() {
+  const tbody = document.querySelector('#email-table tbody');
+  if (tbody) tbody.replaceWith(buildEmailsBody());
+}
+
+function refreshDeleteBtn() {
+  const btn = document.getElementById('delete-btn');
+  if (btn) {
+    btn.disabled = S.selectedEmailIds.size === 0;
+    btn.textContent = `Delete selected (${S.selectedEmailIds.size})`;
+  }
+}
+
+function applyFilterEmails() {
+  const q = S.filterEmails;
+  S.filteredEmails = q
+    ? S.emails.filter(e => e.subject.toLowerCase().includes(q) || e.date.includes(q))
+    : [...S.emails];
+  refreshEmailsTable();
+}
+
+async function showPreview(email) {
+  const pane = document.getElementById('preview-pane');
+  if (!pane) return;
+
+  let preview = email.preview;
+
+  if (!preview) {
+    const handle = S.fileHandles.get(email.messageId);
+    if (handle) {
+      try {
+        const file = await handle.getFile();
+        const text = await file.text();
+        const sep = text.includes('\r\n') ? '\r\n' : '\n';
+        const dbl = sep + sep;
+        const hEnd = text.indexOf(dbl);
+        const headers = hEnd >= 0 ? parseHeaders(text.slice(0, hEnd)) : {};
+        preview = extractPreview(text, headers);
+        // cache it
+        email.preview = preview;
+      } catch { /* no preview */ }
+    }
+  }
+
+  pane.innerHTML = '';
+  pane.appendChild(h('div', { class: 'preview-header' }, email.subject));
+  pane.appendChild(h('div', { class: 'preview-body' },
+    preview || '(no preview — re-import to load previews)',
+  ));
+}
+
+// ── Delete screen ─────────────────────────────────────────────────────────────
+
+function renderDeleteScreen() {
+  const wrap = h('div', { class: 'main-content' });
+
+  wrap.appendChild(h('div', { class: 'back-link', onclick: () => navigateTo('emails', { sender: S.selectedSender }) },
+    '← Back to emails',
+  ));
+
+  const inner = h('div', { class: 'delete-wrap' });
+  inner.appendChild(h('div', { class: 'delete-title' },
+    `Delete emails from ${S.selectedSender?.email || 'sender'}`));
+
+  // Session input
+  const sessionCard = h('div', { class: 'card' });
+  sessionCard.appendChild(h('div', { class: 'card-title' }, 'Protonmail Session'));
+  sessionCard.appendChild(h('p', { style: 'font-size:13px;color:var(--text-dim);margin-bottom:12px;line-height:1.6;' },
+    'Open Protonmail in your browser. Press F12 → Network → click any request → copy the Cookie header value and paste it below.',
+  ));
+  const cookieInput = h('textarea', {
+    class: 'form-input',
+    id: 'cookie-input',
+    placeholder: 'AUTH-xxxxxxxx=token; Session-Id=xxx; ...',
+    style: 'min-height:70px;font-size:11px;',
+  });
+  const statusRow = h('div', { class: 'session-status', style: 'margin-top:10px;' },
+    h('span', { class: `dot ${S.sessionValid === true ? 'dot-ok' : S.sessionValid === false ? 'dot-err' : 'dot-idle'}`, id: 'sess-dot' }),
+    h('span', { id: 'sess-msg', style: 'font-size:13px;' },
+      S.sessionValid === true ? 'Session valid' :
+      S.sessionValid === false ? 'Session invalid or expired' :
+      'No session verified',
+    ),
+    h('button', { class: 'btn btn-ghost btn-sm', style: 'margin-left:auto;', onclick: handleVerifySession }, 'Verify'),
+  );
+  sessionCard.append(cookieInput, statusRow);
+  inner.appendChild(sessionCard);
+
+  // Email selection
+  const selectCard = h('div', { class: 'card' });
+  selectCard.appendChild(h('div', { class: 'card-title' }, `Emails to delete (${S.selectedEmailIds.size})`));
+
+  const selectable = S.emails.filter(e => !e.deleted && e.protonId);
+  const noProtonId = S.emails.filter(e => !e.deleted && !e.protonId);
+
+  if (selectable.length === 0) {
+    selectCard.appendChild(h('div', { class: 'alert alert-info' },
+      'No emails with Protonmail IDs found. Import with .metadata.json files to enable server deletion.'));
   } else {
-    msg = `<div class="del-msg">Deleting ${d.done} / ${d.total}…</div>`;
+    const list = h('div', { class: 'email-checklist' });
+    selectable.forEach(email => {
+      const row = h('div', { class: 'email-check-row' });
+      const cb = h('input', { type: 'checkbox', checked: S.selectedEmailIds.has(email.messageId) ? 'checked' : '' });
+      cb.addEventListener('change', () => {
+        if (cb.checked) S.selectedEmailIds.add(email.messageId);
+        else S.selectedEmailIds.delete(email.messageId);
+        refreshDeleteConfirmBtn();
+      });
+      row.append(
+        cb,
+        h('span', { class: 'row-subject' }, email.subject),
+        h('span', { class: 'row-date' }, email.date || ''),
+      );
+      list.appendChild(row);
+    });
+    selectCard.appendChild(list);
   }
 
-  setContent(`<div class="loading-screen">
-    ${msg}
-    <div class="loading-bar-wrap" style="max-width:480px;width:100%">
-      <div class="loading-bar-fill" style="width:${pct}%"></div>
-    </div>
-    <div class="loading-pct">${pct}%</div>
-  </div>`);
+  if (noProtonId.length > 0) {
+    selectCard.appendChild(h('p', { style: 'font-size:12px;color:var(--text-dim);margin-top:8px;' },
+      `${noProtonId.length} email(s) have no Protonmail ID and will be skipped.`));
+  }
+
+  inner.appendChild(selectCard);
+
+  // Delete button
+  const confirmBtn = h('button', {
+    id: 'confirm-delete-btn',
+    class: 'btn btn-danger',
+    style: 'align-self:flex-start;',
+    disabled: (S.selectedEmailIds.size === 0 || !S.sessionValid || S.deleteInProgress) ? 'disabled' : '',
+    onclick: handleConfirmDelete,
+  }, `Delete ${S.selectedEmailIds.size} message(s) permanently`);
+  inner.appendChild(confirmBtn);
+
+  // Log
+  if (S.deleteLog.length > 0) {
+    const logBox = h('div', { class: 'log-box', id: 'delete-log' });
+    S.deleteLog.forEach(entry => {
+      logBox.appendChild(h('div', { class: `log-${entry.type}` }, entry.msg));
+    });
+    inner.appendChild(logBox);
+  }
+
+  if (S.deleteDone) {
+    inner.appendChild(h('div', { class: 'alert alert-success' }, 'All selected messages have been deleted from Protonmail.'));
+  }
+
+  wrap.appendChild(inner);
+  return wrap;
 }
 
-// ── deleted senders screen ───────────────────────────────────────────────────
-
-let _deletedSendersData = null;
-
-function renderDeletedSendersTable(d) {
-  const filter = (document.getElementById('deleted-senders-filter')?.value || '').toLowerCase();
-  let rows = '';
-  for (const r of d.rows) {
-    if (filter && !r.email.toLowerCase().includes(filter)) continue;
-    const cur   = r.is_cursor ? 'cursor-row' : '';
-    const unsub = r.unsubscribed
-      ? '<span class="check-on">✓</span>'
-      : '<span class="check-off">·</span>';
-    const cu = r.can_unsub
-      ? '<span class="can-unsub">(can unsubscribe)</span>' : '';
-    rows += `<tr class="${cur}" onclick="sendGoto(${r.index})">
-      <td class="c-unsub">${unsub}</td>
-      <td class="c-sender">${esc(r.email)}${cu}</td>
-      <td class="c-emails">${r.deleted_count}</td>
-    </tr>`;
-  }
-  const tbody = document.getElementById('deleted-senders-tbody');
-  if (tbody) {
-    tbody.innerHTML = rows;
-    scrollCursor();
-  }
-}
-
-function renderDeletedSenders(d) {
-  hideFilterBar();
-  _deletedSendersData = d;
-  setHeader(`Mail Spam Toolkit  —  Deleted Senders (${d.total})`);
-  setStatus('');
-  setFooter(kbd('↑↓')+' Navigate &nbsp; '+kbd('Enter')+' View deleted emails &nbsp; '+kbd('U')+' Toggle unsubscribed &nbsp; '+kbd('B')+' Back');
-
-  if (d.total === 0) {
-    setContent(`<div class="att-screen"><p class="att-empty">No senders with deleted emails yet.</p></div>`);
-    return;
-  }
-
-  const prevFilter = document.getElementById('deleted-senders-filter')?.value || '';
-
-  const existingTbody = document.getElementById('deleted-senders-tbody');
-  if (existingTbody) {
-    renderDeletedSendersTable(d);
-    return;
-  }
-
-  setContent(`<div>
-    <div class="filter-bar" style="background:transparent;border:none;padding:6px 12px">
-      <input id="deleted-senders-filter" type="text" placeholder="Filter by sender…"
-             style="max-width:360px" spellcheck="false" autocomplete="off"
-             value="${esc(prevFilter)}">
-    </div>
-    <table class="data-table">
-      <thead><tr>
-        <th class="c-unsub">Unsub</th>
-        <th class="c-sender">Sender</th>
-        <th class="c-emails">Deleted</th>
-      </tr></thead>
-      <tbody id="deleted-senders-tbody"></tbody>
-    </table>
-  </div>`);
-
-  renderDeletedSendersTable(d);
-
-  document.getElementById('deleted-senders-filter').addEventListener('input', () => {
-    if (_deletedSendersData) renderDeletedSendersTable(_deletedSendersData);
-  });
-}
-
-// ── deleted emails screen ────────────────────────────────────────────────────
-
-let _deletedData = null;
-
-function renderDeletedEmailsTable(d) {
-  const filter = (document.getElementById('deleted-filter')?.value || '').toLowerCase();
-  let rows = '';
-  for (const r of d.rows) {
-    if (filter && !r.subject.toLowerCase().includes(filter)) continue;
-    const cur    = r.is_cursor ? 'cursor-row' : '';
-    const backup = r.has_backup
-      ? '<span class="del-backup-badge">⊙ backup</span>'
-      : '';
-    rows += `<tr class="${cur} del-row">
-      <td class="c-subject del-subject">${esc(r.subject)}${backup}</td>
-      <td class="c-date">${esc(r.date_str)}</td>
-      <td class="del-date-col">${esc(r.deleted_at)}</td>
-    </tr>`;
-  }
-  const tbody = document.getElementById('deleted-tbody');
-  if (tbody) {
-    tbody.innerHTML = rows;
-    scrollCursor();
+function refreshDeleteConfirmBtn() {
+  const btn = document.getElementById('confirm-delete-btn');
+  if (btn) {
+    const disabled = S.selectedEmailIds.size === 0 || !S.sessionValid || S.deleteInProgress;
+    btn.disabled = disabled;
+    btn.textContent = `Delete ${S.selectedEmailIds.size} message(s) permanently`;
   }
 }
 
-function renderDeletedEmails(d) {
-  hideFilterBar();
-  _deletedData = d;
-  setHeader(`${esc(d.sender)}  —  Deleted Emails (${d.total})`);
-  setStatus('');
-  setFooter(kbd('↑↓') + ' Navigate &nbsp; ' + kbd('B') + ' Back');
+async function handleVerifySession() {
+  const raw = document.getElementById('cookie-input')?.value || '';
+  if (!raw.trim()) { showNotification('Paste a Cookie header value first.', 'error'); return; }
 
-  if (d.total === 0) {
-    setContent(`<div class="att-screen"><p class="att-empty">No deleted emails for this sender.</p></div>`);
-    return;
+  const session = parseCookieString(raw);
+  if (!session) { showNotification('Could not find AUTH-* cookie. Make sure to paste the full Cookie header.', 'error'); return; }
+
+  const dot = document.getElementById('sess-dot');
+  const msg = document.getElementById('sess-msg');
+  if (msg) msg.textContent = 'Verifying…';
+  if (dot) dot.className = 'dot dot-idle';
+
+  try {
+    const res = await apiVerifyProtonSession(session);
+    S.sessionValid = res.valid;
+    S.protonSession = res.valid ? session : null;
+    if (dot) dot.className = `dot ${res.valid ? 'dot-ok' : 'dot-err'}`;
+    if (msg) msg.textContent = res.valid ? 'Session valid' : 'Session invalid or expired';
+    refreshDeleteConfirmBtn();
+  } catch (err) {
+    S.sessionValid = false;
+    if (dot) dot.className = 'dot dot-err';
+    if (msg) msg.textContent = err.message;
   }
-
-  const preview = d.preview || '(no preview available)';
-  const prevFilter = document.getElementById('deleted-filter')?.value || '';
-
-  // If the skeleton already exists, just update dynamic parts
-  const existingTbody = document.getElementById('deleted-tbody');
-  if (existingTbody) {
-    renderDeletedEmailsTable(d);
-    const prevEl = document.getElementById('deleted-preview');
-    if (prevEl) prevEl.textContent = preview;
-    return;
-  }
-
-  setContent(`<div class="split-layout">
-    <div class="emails-pane">
-      <div class="filter-bar" style="background:transparent;border:none;padding:6px 12px">
-        <input id="deleted-filter" type="text" placeholder="Filter by subject…"
-               style="max-width:360px" spellcheck="false" autocomplete="off"
-               value="${esc(prevFilter)}">
-      </div>
-      <table class="data-table">
-        <thead><tr>
-          <th class="c-subject">Subject</th>
-          <th class="c-date">Original Date</th>
-          <th class="del-date-col">Deleted On</th>
-        </tr></thead>
-        <tbody id="deleted-tbody"></tbody>
-      </table>
-    </div>
-    <div class="preview-pane">
-      <div class="preview-label">Preview</div>
-      <div class="preview-body" id="deleted-preview">${esc(preview)}</div>
-    </div>
-  </div>`);
-
-  renderDeletedEmailsTable(d);
-
-  document.getElementById('deleted-filter').addEventListener('input', () => {
-    if (_deletedData) renderDeletedEmailsTable(_deletedData);
-  });
 }
 
-// ── sender analytics screen ──────────────────────────────────────────────────
+async function handleConfirmDelete() {
+  if (!S.protonSession || S.selectedEmailIds.size === 0) return;
 
-function renderSenderAnalytics(d) {
-  hideFilterBar();
-  setHeader(`${esc(d.sender)}  —  Sender Analytics`);
-  setStatus('');
-  setFooter(kbd('←→')+' Year &nbsp; '+kbd('B')+' / '+kbd('Esc')+' Back');
+  S.deleteInProgress = true;
+  S.deleteLog = [];
+  S.deleteDone = false;
+  refreshDeleteConfirmBtn();
 
-  if (!d.years || d.years.length === 0) {
-    setContent(`<div class="sa-screen"><p class="sa-empty">No dated emails found for this sender.</p></div>`);
-    return;
+  const ids = S.emails
+    .filter(e => S.selectedEmailIds.has(e.messageId) && e.protonId)
+    .map(e => e.protonId);
+
+  addLog(`Sending ${ids.length} deletion request(s)…`, 'info');
+
+  try {
+    await apiDeleteMessages(S.protonSession, ids);
+    addLog(`✓ Deleted ${ids.length} message(s) from Protonmail`, 'ok');
+
+    // Mark as deleted in IDB
+    for (const msgId of S.selectedEmailIds) {
+      const email = S.emails.find(e => e.messageId === msgId);
+      if (email) {
+        email.deleted = true;
+        await idbPutOne('emails', email);
+      }
+    }
+
+    // Update sender count
+    if (S.selectedSender) {
+      S.selectedSender.count = Math.max(0, S.selectedSender.count - ids.length);
+      await idbPutOne('senders', S.selectedSender);
+    }
+
+    S.deleteLog.push({ type: 'ok', msg: '✓ Local records updated.' });
+    S.deleteDone = true;
+    S.deleteInProgress = false;
+    renderScreen();
+  } catch (err) {
+    addLog(`✗ Error: ${err.message}`, 'err');
+    S.deleteInProgress = false;
+    renderScreen();
   }
-
-  const prev = d.has_prev
-    ? `<span class="sa-arrow sa-arrow-on">◀</span>`
-    : `<span class="sa-arrow sa-arrow-off">◀</span>`;
-  const next = d.has_next
-    ? `<span class="sa-arrow sa-arrow-on">▶</span>`
-    : `<span class="sa-arrow sa-arrow-off">▶</span>`;
-
-  const bars = d.months.map(m => `
-    <div class="sa-col">
-      <div class="sa-count">${m.count > 0 ? m.count : ''}</div>
-      <div class="sa-bar-track">
-        <div class="sa-bar-fill" style="height:${m.pct}%"></div>
-      </div>
-      <div class="sa-label">${m.month}</div>
-    </div>`).join('');
-
-  setContent(`<div class="sa-screen">
-    <div class="sa-year-row">
-      ${prev}<span class="sa-year">${d.year}</span>${next}
-    </div>
-    <div class="sa-subtitle">${d.total_year} email${d.total_year !== 1 ? 's' : ''} in ${d.year}</div>
-    <div class="sa-chart">${bars}</div>
-  </div>`);
 }
 
-// ── analytics screen ─────────────────────────────────────────────────────────
-
-function renderAnalytics(d) {
-  hideFilterBar();
-  setHeader('Analytics');
-  setStatus('');
-  setFooter(kbd('B')+' / '+kbd('Esc')+' Back');
-
-  const senderBars = d.top_senders.map(r =>
-    `<div class="bar-row">
-      <span class="bar-label" title="${esc(r.sender)}">${esc(r.sender)}</span>
-      <div class="bar-track"><div class="bar-fill" style="width:${r.pct}%"></div></div>
-      <span class="bar-val">${r.count}</span>
-    </div>`
-  ).join('');
-
-  const domainBars = d.top_domains.map(r =>
-    `<div class="bar-row">
-      <span class="bar-label">${esc(r.domain)}</span>
-      <div class="bar-track"><div class="bar-fill" style="width:${r.pct}%;background:var(--yellow)"></div></div>
-      <span class="bar-val">${r.count}</span>
-    </div>`
-  ).join('');
-
-  setContent(`<div class="analytics-grid">
-    <div class="analytics-summary">
-      <div class="stat-block"><div class="stat-num">${d.total_senders}</div><div class="stat-label">Senders</div></div>
-      <div class="stat-block"><div class="stat-num">${d.total_emails}</div><div class="stat-label">Emails</div></div>
-      <div class="stat-block"><div class="stat-num">${d.unsubscribed}</div><div class="stat-label">Unsubscribed</div></div>
-    </div>
-    <div class="analytics-card">
-      <h3>Top Senders by Volume</h3>
-      ${senderBars}
-    </div>
-    <div class="analytics-card">
-      <h3>Top Domains by Emails</h3>
-      ${domainBars}
-    </div>
-  </div>`);
+function addLog(msg, type) {
+  S.deleteLog.push({ msg, type });
+  const logBox = document.getElementById('delete-log');
+  if (logBox) {
+    logBox.appendChild(h('div', { class: `log-${type}` }, msg));
+    logBox.scrollTop = logBox.scrollHeight;
+  }
 }
 
-connect();
+// ─── Cookie parser ────────────────────────────────────────────────────────────
+
+function parseCookieString(raw) {
+  const cookies = {};
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    cookies[k] = v;
+  }
+  const authKey = Object.keys(cookies).find(k => k.startsWith('AUTH-'));
+  if (!authKey) return null;
+  return {
+    uid: authKey.replace('AUTH-', ''),
+    access_token: cookies[authKey],
+    session_id: cookies['Session-Id'] || null,
+  };
+}
+
+// ─── Auth / logout ────────────────────────────────────────────────────────────
+
+function logout() {
+  localStorage.removeItem('mst_token');
+  S.token = null;
+  S.userId = null;
+  S.userEmail = null;
+  S.db = null;
+  S.screen = 'auth';
+  S.authMode = 'login';
+  renderScreen();
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+async function init() {
+  const token = localStorage.getItem('mst_token');
+  if (token && initFromToken(token)) {
+    try {
+      const me = await apiFetch('/auth/me');
+      S.userEmail = me.email;
+      S.db = await openIdb(S.userId);
+      await navigateTo('home');
+      return;
+    } catch {
+      localStorage.removeItem('mst_token');
+      S.token = null;
+    }
+  }
+  renderScreen();
+}
+
+init();

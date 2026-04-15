@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 httpx
 bcrypt
+python-jose[cryptography]
+python-multipart
