@@ -23,7 +23,7 @@ echo "[*] Stopping $SERVICE..."
 $DOCKER compose down --remove-orphans
 
 read -rp "[?] Remove the Docker image as well? (y/N): " REMOVE_IMAGE
-if [[ "${REMOVE_IMAGE,,}" == "y" ]]; then
+if [[ "$(echo "$REMOVE_IMAGE" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
     echo "[*] Removing image..."
     $DOCKER rmi "mail-spam-toolkit-portal:local" 2>/dev/null \
         && echo "[ok] Image removed." \
@@ -31,7 +31,7 @@ if [[ "${REMOVE_IMAGE,,}" == "y" ]]; then
 fi
 
 read -rp "[?] Remove the database volume? (y/N): " REMOVE_VOL
-if [[ "${REMOVE_VOL,,}" == "y" ]]; then
+if [[ "$(echo "$REMOVE_VOL" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
     echo "[*] Removing volume mail-spam-toolkit-db..."
     $DOCKER volume rm mail-spam-toolkit-db 2>/dev/null \
         && echo "[ok] Volume removed." \
